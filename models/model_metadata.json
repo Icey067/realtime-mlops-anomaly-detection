@@ -1,0 +1,11 @@
+{
+  "model_type": "Autoencoder",
+  "input_dim": 30,
+  "hidden_dim": 16,
+  "latent_dim": 8,
+  "anomaly_threshold": 1.3531979465484623,
+  "percentile": 98.0,
+  "val_mse_mean": 0.7775425018761344,
+  "trained_at": 1792439756.5889373,
+  "train_samples": 19960
+}

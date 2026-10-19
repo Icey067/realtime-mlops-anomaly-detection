@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------------------------------
+  # Redis Streams Ingestion Backbone
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--tcp-backlog", "511"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+  # ----------------------------------------------------------------------------
+  # FastAPI Production Microservice (Quantized ONNX Runtime)
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: sentinel-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - ENVIRONMENT=production
+      - API_WORKERS=4
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+  # ----------------------------------------------------------------------------
+  # Streaming Producer (Synthetic & Drift Ingestion)
+  # ----------------------------------------------------------------------------
+  producer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: sentinel-producer
+    command: ["python", "-m", "src.ingestion.producer", "--drift-interval", "20"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PRODUCER_BATCH_SIZE=50
+      - PRODUCER_EMIT_INTERVAL_SEC=0.05
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+  # ----------------------------------------------------------------------------
+  # Streaming Consumer Group Worker
+  # ----------------------------------------------------------------------------
+  consumer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: sentinel-consumer
+    command: ["python", "-m", "src.ingestion.consumer"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CONSUMER_BATCH_SIZE=100
+      - LATENCY_BUDGET_MS=10.0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+  # ----------------------------------------------------------------------------
+  # MLflow Tracking Server
+  # ----------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    container_name: sentinel-mlflow
+    ports:
+      - "5000:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root /mlruns
+    volumes:
+      - ../mlruns:/mlruns
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+  # ----------------------------------------------------------------------------
+  # Prometheus Telemetry Collector
+  # ----------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sentinel-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+  # ----------------------------------------------------------------------------
+  # Grafana Telemetry Dashboard
+  # ----------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sentinel-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+networks:
+  sentinel-net:
+    driver: bridge

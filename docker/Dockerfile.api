@@ -1,0 +1,62 @@
+# ==============================================================================
+# Multi-stage Dockerfile for Sentinel MLOps Real-Time Anomaly Engine API
+# Target: Production-grade, secure, non-root, under 300MB image footprint
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: Builder
+# ------------------------------------------------------------------------------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN python -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip setuptools wheel && \
+    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# ------------------------------------------------------------------------------
+# Stage 2: Production Runtime
+# ------------------------------------------------------------------------------
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ENVIRONMENT=production
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash sentinel
+
+COPY --from=builder /opt/venv /opt/venv
+
+COPY src/ ./src/
+COPY data/ ./data/
+COPY models/ ./models/
+
+# Ensure proper non-root permissions
+RUN mkdir -p /app/data /app/models && \
+    chown -R sentinel:sentinel /app
+
+USER sentinel
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
+
+ENTRYPOINT ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
