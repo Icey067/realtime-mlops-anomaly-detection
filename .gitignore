@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Data & Models
+data/*.csv
+data/*.parquet
+models/*.pt
+models/*.onnx
+models/*.joblib
+mlruns/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node / React
+node_modules/
+frontend/dist/
+frontend/.next/
+frontend/build/
