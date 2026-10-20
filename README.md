@@ -15,7 +15,7 @@ An end-to-end, **sub-15ms latency streaming anomaly detection system** designed 
 ```mermaid
 flowchart TD
     subgraph Ingestion ["Streaming & Ingestion Layer"]
-        CSV[Kaggle creditcard.csv] --> Producer[Async Producer with Controlled Drift]
+        CSV[Kaggle creditcard.csv / Baseline] --> Producer[Async Producer with Controlled Drift]
         Producer -->|XADD| Stream[(Redis Stream: transactions:stream)]
         Stream -->|XREADGROUP| Consumer[Redis Consumer Group Worker]
         Consumer -->|Sub-10ms Parse| Pydantic[Pydantic v2 Payload Validation]
@@ -27,8 +27,8 @@ flowchart TD
         Scaler --> Predictor[ONNX Runtime CPU InferenceSession]
         ModelWeights[(Autoencoder Dynamic INT8)] -.-> Predictor
         Predictor --> MSE[Reconstruction MSE Calculation]
-        MSE --> Decision{MSE > 98th Percentile Cutoff?}
-        Decision -->|Yes| AnomalyFlag[Flag Anomaly / Fraud Alert]
+        Decision{MSE > 98th Percentile Cutoff?} -->|Yes| AnomalyFlag[Flag Anomaly / Fraud Alert]
+        MSE --> Decision
         Decision -->|No| NormalFlag[Normal Transaction]
     end
 
@@ -68,12 +68,32 @@ flowchart TD
 
 ---
 
+## Dataset & Unsupervised Training Strategy
+
+The model operates on a **30-dimensional feature space**: `Time`, `V1` through `V28` (principal components from PCA), and `Amount`.
+
+- **Primary Dataset**: [Kaggle Credit Card Fraud Detection](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) (`data/creditcard.csv`).
+- **One-Class Unsupervised Strategy**: The Autoencoder is trained **strictly on normal transactions (`Class == 0`)** (284,315 records; 227,452 train samples after 80/20 split). It learns the reconstruction manifold of genuine financial behavior.
+- **Anomaly Cutoff Calibration**: The 98th percentile reconstruction error (MSE) across the validation set is saved as the anomaly threshold (`~2.2522`). Incoming transactions with $\text{MSE} > \text{threshold}$ are classified as anomalies/fraud.
+- **Automated Synthetic Fallback**: If `creditcard.csv` is not present in `data/`, the training pipeline automatically synthesizes 25,000 baseline records mimicking the Kaggle statistical distribution into `data/baseline_distribution.csv`.
+
+> **Note**: Pre-trained model weights, INT8 quantized graph, fitted scaler, and metadata are **already pre-packaged** in [`models/`](models/).
+
+---
+
 ## Directory Structure
 
 ```
 ├── .github/workflows/ci.yml   # CI/CD pipeline for model validation & linting
 ├── data/                       # Kaggle creditcard.csv storage and baseline distributions
+│   ├── creditcard.csv         # Full Kaggle dataset (284,807 transactions)
+│   └── baseline_distribution.csv # Synthetic baseline reference for drift detection
 ├── models/                     # PyTorch checkpoints, ONNX graphs, INT8 quantized models, scalers
+│   ├── autoencoder.pt         # Trained PyTorch model weights (30 -> 16 -> 8 -> 16 -> 30)
+│   ├── autoencoder.onnx       # Exported ONNX computation graph (opset 14)
+│   ├── autoencoder_int8.onnx  # Dynamic INT8 quantized ONNX graph (<0.1ms latency)
+│   ├── scaler.joblib          # Fitted StandardScaler for 30 features
+│   └── model_metadata.json    # Calibrated anomaly threshold (98th percentile) & metrics
 ├── src/
 │   ├── config.py              # Centralized Pydantic-settings configuration
 │   ├── schemas/               # Pydantic v2 models for ingestion & response
@@ -105,6 +125,7 @@ flowchart TD
 ├── benchmarks/                # Locust load testing suite (500+ RPS test)
 │   └── locustfile.py
 ├── tests/                     # Comprehensive test suite across all phases
+├── demo.py                    # Standalone instant terminal verification demo
 ├── requirements.txt
 └── README.md
 ```
@@ -114,7 +135,13 @@ flowchart TD
 ## Quickstart: Local Standalone Setup
 
 ### 1. Initialize Virtual Environment & Dependencies
+
 ```bash
+# Clone the repository
+git clone https://github.com/Icey067/realtime-mlops-anomaly-detection.git
+cd realtime-mlops-anomaly-detection
+
+# Create and activate virtual environment
 python -m venv .venv
 
 # On Linux/macOS:
@@ -122,58 +149,115 @@ source .venv/bin/activate
 # On Windows (PowerShell):
 .venv\Scripts\Activate.ps1
 
+# Install requirements
 pip install -r requirements.txt
 ```
 
-### 2. Train the Unsupervised Autoencoder & Calibrate Threshold
-Trains exclusively on normal transaction patterns (`Class == 0`) and calibrates the 98th percentile reconstruction threshold:
+> **Important (Windows)**: Always ensure `.venv\Scripts\Activate.ps1` is executed in your terminal, or invoke `.venv\Scripts\python.exe` directly so packages like `onnx` and `onnxruntime` are available in your shell session.
+
+---
+
+### 2. Instant Verification Demo (3-Second Live Test)
+
+To immediately verify that the ONNX INT8 model and inference pipeline are functioning without starting external databases:
+
 ```bash
-python -m src.model.train --epochs 10 --batch-size 256
+python demo.py
 ```
 
-### 3. Export & Quantize to ONNX INT8
-Quantizes the model to dynamic INT8 and runs CPU latency benchmarks:
+*Sample Output:*
+```text
+======================================================================
+  SENTINEL MLOps Real-Time Anomaly Detection Engine - Live Demo
+======================================================================
+
+[1] Initializing Quantized ONNX INT8 Predictor...
+    - Model Status     : READY
+    - Calibrated Cutoff: 2.2522 (98th percentile MSE)
+
+[2] Testing NORMAL Transaction:
+    - Amount           : $45.50
+    - Reconstruction MSE: 0.7100 (Threshold: 2.2522)
+    - Decision         : NORMAL TRANSACTION
+    - Inference Latency: 4.923 ms (Target SLA: < 15.0 ms)
+
+[3] Testing ANOMALOUS (Fraud Outlier) Transaction:
+    - Amount           : $95,000.00
+    - Reconstruction MSE: 4210.0801 (Threshold: 2.2522)
+    - Decision         : ANOMALY / FRAUD
+    - Inference Latency: 0.329 ms (Target SLA: < 15.0 ms)
+
+======================================================================
+  RESULT: Sub-millisecond inference verified. System operational!
+======================================================================
+```
+
+---
+
+### 3. Model Training & Quantization *(Optional — Pre-Trained Weights Provided)*
+
+The pre-trained model is already saved in `models/`. If you want to retrain from scratch:
+
 ```bash
+# Step A: Train PyTorch Autoencoder on normal records (Class == 0)
+python -m src.model.train --epochs 15 --batch-size 256
+
+# Step B: Export to ONNX and quantize to dynamic INT8
 python -m src.model.quantize
 ```
-*Expected latency output: `FP32 = ~0.02ms / sample | INT8 = ~0.05ms / sample`.*
+*Expected latency output: `FP32 = ~0.05ms / sample | INT8 = ~0.06ms / sample`.*
+
+---
 
 ### 4. Run Test Suite
+
 ```bash
-python -m pytest tests/ -v
+pytest tests/ -v
 ```
+Runs 10 comprehensive unit and integration tests covering schema bounds, ONNX quantized predictor latency SLA, FastAPI endpoints, and data drift calculations.
+
+---
 
 ### 5. Start the FastAPI Microservice
+
 ```bash
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-- Interactive Swagger UI: `http://localhost:8000/docs`
-- Prometheus Metrics: `http://localhost:8000/metrics`
-- Health Probe: `http://localhost:8000/healthz`
+- **Interactive Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Prometheus Metrics**: [http://localhost:8000/metrics](http://localhost:8000/metrics)
+- **Health Probe**: [http://localhost:8000/healthz](http://localhost:8000/healthz)
 
-### 6. Run Redis Streaming Producer & Consumer
+---
+
+### 6. Run Redis Streaming Ingestion (Producer & Consumer)
+
 In separate terminal sessions (with Redis running on `localhost:6379`):
+
 ```bash
-# Start Consumer Group worker tracking sub-10ms latency:
+# Terminal A: Start Consumer Group worker tracking sub-10ms latency:
 python -m src.ingestion.consumer
 
-# Start Streaming Producer injecting controlled drift (+30% mean shift every 20 batches):
+# Terminal B: Start Streaming Producer injecting controlled drift (+30% mean shift every 20 batches):
 python -m src.ingestion.producer --drift-interval 20
 ```
 
+---
+
 ### 7. Launch React 19 Live Dashboard
+
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-Navigate to `http://localhost:3000` to monitor live transaction streams, fraud flags, and latency sparklines.
+Navigate to [http://localhost:3000](http://localhost:3000) to monitor live transaction streams, fraud flags, throughput gauges, and latency sparklines.
 
 ---
 
 ## Docker Compose Full Stack Deployment
 
-Deploy the entire production cluster in one command:
+Deploy the entire production cluster (Redis, FastAPI, Producer, Consumer, Prometheus, Grafana, MLflow) in one command:
+
 ```bash
 cd docker
 docker-compose up --build -d
@@ -192,6 +276,7 @@ docker-compose up --build -d
 ## Load Testing: 500+ Requests/Sec Verification
 
 To benchmark the inference service against the strict sub-15ms SLA target:
+
 ```bash
 locust -f benchmarks/locustfile.py --host http://localhost:8000 --headless -u 500 -r 50 -t 60s
 ```
