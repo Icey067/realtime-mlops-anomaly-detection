@@ -1,9 +1,4 @@
-"""High-performance Redis Consumer Group worker for streaming transactions.
-
-Parses stream events, performs strict Pydantic v2 payload validation,
-acknowledges messages via XACK, routes corrupt events to a Dead Letter Queue (DLQ),
-and tracks end-to-end sub-10ms pipeline latency metrics.
-"""
+"""Redis Streams consumer group worker with validation, DLQ routing, and drift sampling."""
 
 from __future__ import annotations
 
@@ -14,54 +9,58 @@ import logging
 import signal
 import sys
 import time
-from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional, Tuple
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import redis.asyncio as aioredis
-from pydantic import ValidationError
 from redis.asyncio.client import Redis
 from redis.exceptions import ResponseError
 
 from src.config import Settings, get_settings
+from src.logging_config import configure_logging
+from src.mlops.drift_monitor import DataDriftMonitor
+from src.mlops.retrain_pipeline import retrain_pipeline
 from src.schemas.telemetry import LatencyTelemetry
 from src.schemas.transaction import TransactionPayload
 
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("sentinel.consumer")
+logger = logging.getLogger(__name__)
 
 
 class TransactionConsumer:
-    """Async Redis Consumer Group processor with latency budget tracking."""
+    """Reads transaction messages from a Redis consumer group."""
 
     def __init__(
         self,
-        settings: Optional[Settings] = None,
-        consumer_name: Optional[str] = None,
-        on_payload_callback: Optional[
-            Callable[[TransactionPayload], Coroutine[Any, Any, None]]
-        ] = None,
+        settings: Settings | None = None,
+        consumer_name: str | None = None,
+        on_payload_callback: Callable[[TransactionPayload], Coroutine[Any, Any, None]] | None = None,
+        drift_monitor: DataDriftMonitor | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.consumer_name = consumer_name or self.settings.REDIS_CONSUMER_NAME
-        self.redis_client: Optional[Redis] = None
+        self.redis_client: Redis | None = None
         self._running = False
         self._on_payload_callback = on_payload_callback
+        self._drift_monitor = drift_monitor
 
-        # Latency & throughput tracking metrics (rolling window of 1,000 transactions)
-        self.latency_window: Deque[float] = collections.deque(maxlen=1000)
-        self.validation_window: Deque[float] = collections.deque(maxlen=1000)
+        self.latency_window: collections.deque[float] = collections.deque(maxlen=1000)
+        self.validation_window: collections.deque[float] = collections.deque(maxlen=1000)
         self.total_processed = 0
         self.total_validation_errors = 0
         self.total_latency_breaches = 0
 
+    def _get_drift_monitor(self) -> DataDriftMonitor:
+        if self._drift_monitor is None:
+            self._drift_monitor = DataDriftMonitor(
+                settings=self.settings,
+                on_drift_alert=retrain_pipeline.handle_drift_alert,
+            )
+        return self._drift_monitor
+
     async def connect(self) -> None:
-        """Establish Redis connection and idempotently create the Consumer Group."""
+        """Open the connection pool and create the consumer group if needed."""
         logger.info(
-            "Initializing consumer '%s' for group '%s' on stream '%s'...",
+            "Starting consumer %s in group %s on stream %s",
             self.consumer_name,
             self.settings.REDIS_CONSUMER_GROUP,
             self.settings.REDIS_STREAM_KEY,
@@ -74,7 +73,6 @@ class TransactionConsumer:
         )
         await self.redis_client.ping()
 
-        # Create consumer group if not already present
         try:
             await self.redis_client.xgroup_create(
                 name=self.settings.REDIS_STREAM_KEY,
@@ -82,123 +80,113 @@ class TransactionConsumer:
                 id="0",
                 mkstream=True,
             )
-            logger.info("Created Redis consumer group: %s", self.settings.REDIS_CONSUMER_GROUP)
-        except ResponseError as e:
-            if "BUSYGROUP" in str(e):
-                logger.info("Consumer group '%s' already exists. Reusing.", self.settings.REDIS_CONSUMER_GROUP)
-            else:
-                logger.error("Failed to create consumer group: %s", e)
+            logger.info("Created consumer group %s", self.settings.REDIS_CONSUMER_GROUP)
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
                 raise
+            logger.info("Consumer group %s already exists", self.settings.REDIS_CONSUMER_GROUP)
 
     async def close(self) -> None:
-        """Close Redis connection and clean up."""
         if self.redis_client:
-            await self.redis_client.close()
-            logger.info("Consumer connection closed.")
+            await self.redis_client.aclose()
 
-    async def _send_to_dlq(self, message_id: bytes, raw_data: Dict[Any, Any], error_reason: str) -> None:
-        """Route malformed payloads to Dead Letter Queue for auditing."""
+    async def _send_to_dlq(self, message_id: bytes, raw_data: dict[Any, Any], error_reason: str) -> None:
+        """Store an unparseable message for later inspection."""
         if not self.redis_client:
             return
-        dlq_entry = {
-            "original_id": message_id.decode("utf-8") if isinstance(message_id, bytes) else str(message_id),
-            "failed_at": str(time.time()),
-            "error_reason": error_reason,
-            "raw_payload": str(raw_data),
-        }
-        await self.redis_client.xadd(self.settings.REDIS_DLQ_KEY, dlq_entry, maxlen=10000)
-        logger.warning("Routed corrupted message %s to DLQ: %s", message_id, error_reason)
+        await self.redis_client.xadd(
+            self.settings.REDIS_DLQ_KEY,
+            {
+                "original_id": message_id.decode("utf-8") if isinstance(message_id, bytes) else str(message_id),
+                "failed_at": str(time.time()),
+                "error_reason": error_reason,
+                "raw_payload": str(raw_data),
+            },
+            maxlen=10000,
+        )
+        logger.warning("Sent message %s to DLQ: %s", message_id, error_reason)
 
-    def _calculate_percentiles(self, window: Deque[float]) -> Tuple[float, float, float]:
-        """Compute p50, p95, and p99 from a rolling latency window."""
+    def _calculate_percentiles(self, window: collections.deque[float]) -> tuple[float, float, float]:
         if not window:
             return 0.0, 0.0, 0.0
-        sorted_lat = sorted(window)
-        n = len(sorted_lat)
-        p50 = sorted_lat[int(0.50 * n)]
-        p95 = sorted_lat[min(int(0.95 * n), n - 1)]
-        p99 = sorted_lat[min(int(0.99 * n), n - 1)]
-        return p50, p95, p99
+        ordered = sorted(window)
+        last = len(ordered) - 1
+        return (
+            ordered[int(0.50 * last)],
+            ordered[int(0.95 * last)],
+            ordered[int(0.99 * last)],
+        )
 
     async def process_message(
         self,
         message_id: bytes,
-        raw_fields: Dict[Any, Any],
-    ) -> Optional[Tuple[TransactionPayload, LatencyTelemetry]]:
-        """Parse raw stream event, validate schema, record latencies, and return validated payload."""
+        raw_fields: dict[Any, Any],
+    ) -> tuple[TransactionPayload, LatencyTelemetry] | None:
+        """Validate one stream message and record its latency."""
         now = time.time()
-        start_val = time.perf_counter()
+        validation_start = time.perf_counter()
 
         try:
-            # High-speed Pydantic v2 validation
             payload = TransactionPayload.from_redis_dict(raw_fields)
-            val_latency_ms = (time.perf_counter() - start_val) * 1000
+            validation_ms = (time.perf_counter() - validation_start) * 1000
+            ingestion_ms = max((now - payload.timestamp) * 1000, 0.0)
+            total_ms = ingestion_ms + validation_ms
 
-            # End-to-end ingestion latency: (consumer receive time - producer timestamp)
-            ingest_latency_ms = max((now - payload.timestamp) * 1000, 0.0)
-            total_latency_ms = ingest_latency_ms + val_latency_ms
-
-            # Track rolling latency stats
-            self.latency_window.append(total_latency_ms)
-            self.validation_window.append(val_latency_ms)
-
-            # Check strict latency budget (e.g. 10ms)
-            if total_latency_ms > self.settings.LATENCY_BUDGET_MS:
+            self.latency_window.append(total_ms)
+            self.validation_window.append(validation_ms)
+            if total_ms > self.settings.LATENCY_BUDGET_MS:
                 self.total_latency_breaches += 1
 
-            telemetry = LatencyTelemetry(
-                ingestion_latency_ms=round(ingest_latency_ms, 3),
-                validation_latency_ms=round(val_latency_ms, 3),
-                total_pipeline_latency_ms=round(total_latency_ms, 3),
-            )
-            return payload, telemetry
+            try:
+                self._get_drift_monitor().record_inference_features(payload.to_feature_vector())
+            except Exception:
+                logger.exception("Could not record features for drift analysis")
 
-        except (ValidationError, Exception) as err:
+            return payload, LatencyTelemetry(
+                ingestion_latency_ms=round(ingestion_ms, 3),
+                validation_latency_ms=round(validation_ms, 3),
+                total_pipeline_latency_ms=round(total_ms, 3),
+            )
+        except Exception as exc:
             self.total_validation_errors += 1
-            await self._send_to_dlq(message_id, raw_fields, str(err))
+            await self._send_to_dlq(message_id, raw_fields, str(exc))
             return None
 
-    async def start_consuming(self, max_messages: Optional[int] = None) -> None:
-        """Main consumer loop reading from Redis Consumer Group."""
+    async def start_consuming(self, max_messages: int | None = None) -> None:
+        """Poll the consumer group until stopped or until max_messages is reached."""
         if not self.redis_client:
-            raise RuntimeError("Consumer is not connected. Call connect() first.")
+            raise RuntimeError("Consumer is not connected; call connect() first")
 
         self._running = True
         logger.info(
-            "Consumer '%s' running. Fetching batches of %d (Block: %dms, Budget: %.1fms)...",
-            self.consumer_name,
+            "Consuming batches of %d (block %dms, latency budget %.1fms)",
             self.settings.CONSUMER_BATCH_SIZE,
             self.settings.CONSUMER_BLOCK_MS,
             self.settings.LATENCY_BUDGET_MS,
         )
-
         last_log_time = time.time()
 
         try:
             while self._running:
-                # XREADGROUP fetches messages assigned to this consumer
-                streams_response = await self.redis_client.xreadgroup(
+                response = await self.redis_client.xreadgroup(
                     groupname=self.settings.REDIS_CONSUMER_GROUP,
                     consumername=self.consumer_name,
                     streams={self.settings.REDIS_STREAM_KEY: ">"},
                     count=self.settings.CONSUMER_BATCH_SIZE,
                     block=self.settings.CONSUMER_BLOCK_MS,
                 )
-
-                if not streams_response:
+                if not response:
                     continue
 
-                for stream_name, messages in streams_response:
-                    ack_ids: List[bytes] = []
-
+                for _, messages in response:
+                    ack_ids: list[bytes] = []
                     for message_id, fields in messages:
                         result = await self.process_message(message_id, fields)
                         ack_ids.append(message_id)
 
                         if result:
-                            payload, telemetry = result
+                            payload, _ = result
                             self.total_processed += 1
-
                             if self._on_payload_callback:
                                 await self._on_payload_callback(payload)
 
@@ -206,7 +194,6 @@ class TransactionConsumer:
                             self._running = False
                             break
 
-                    # Acknowledge processed messages in batch
                     if ack_ids:
                         await self.redis_client.xack(
                             self.settings.REDIS_STREAM_KEY,
@@ -214,13 +201,13 @@ class TransactionConsumer:
                             *ack_ids,
                         )
 
-                # Periodic performance summary telemetry
                 now = time.time()
                 if now - last_log_time >= 5.0 and self.latency_window:
                     p50, p95, p99 = self._calculate_percentiles(self.latency_window)
                     _, val_p95, _ = self._calculate_percentiles(self.validation_window)
                     logger.info(
-                        "Processed: %d tx | Latency p50: %.2fms | p95: %.2fms | p99: %.2fms | Val p95: %.2fms | Errors: %d | Budget Breaches: %d",
+                        "Processed %d tx | p50 %.2fms | p95 %.2fms | p99 %.2fms | "
+                        "validation p95 %.2fms | errors %d | breaches %d",
                         self.total_processed,
                         p50,
                         p95,
@@ -230,20 +217,30 @@ class TransactionConsumer:
                         self.total_latency_breaches,
                     )
                     last_log_time = now
+                    try:
+                        score, _, feature_metrics = self._get_drift_monitor().compute_drift()
+                        if feature_metrics:
+                            await self.redis_client.set(
+                                self.settings.DRIFT_SCORE_KEY,
+                                str(score),
+                                ex=300,
+                            )
+                    except Exception:
+                        logger.exception("Drift computation failed")
 
         except asyncio.CancelledError:
-            logger.info("Consumer received shutdown signal.")
+            logger.info("Consumer cancelled")
         finally:
             self._running = False
 
     def stop(self) -> None:
-        """Signal consumer loop to cease polling."""
+        """Request a graceful stop."""
         self._running = False
 
 
 async def main() -> None:
-    """CLI entrypoint for running the consumer standalone."""
-    parser = argparse.ArgumentParser(description="Sentinel Redis Stream Consumer")
+    configure_logging()
+    parser = argparse.ArgumentParser(description="Consume transactions from a Redis stream")
     parser.add_argument("--name", type=str, default=None, help="Consumer instance name")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size for XREADGROUP")
     parser.add_argument("--max-messages", type=int, default=None, help="Stop after N messages")
@@ -276,5 +273,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Consumer stopped by user.")
+        logger.info("Consumer interrupted")
         sys.exit(0)

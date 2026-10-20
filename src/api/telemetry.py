@@ -1,15 +1,12 @@
-"""Prometheus metrics and real-time telemetry buffer for Sentinel MLOps."""
+"""Prometheus metrics and the in-memory telemetry buffer."""
 
 from __future__ import annotations
 
 import collections
 import time
-from typing import Deque, Dict, List, Optional
+
 from prometheus_client import Counter, Gauge, Histogram
 
-# --------------------------------------------------------------------------
-# Prometheus Telemetry Metrics
-# --------------------------------------------------------------------------
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
     "Total HTTP requests handled by the Sentinel API",
@@ -45,32 +42,34 @@ DATA_DRIFT_SCORE_GAUGE = Gauge(
 )
 
 
-# --------------------------------------------------------------------------
-# Rolling In-Memory Telemetry Buffer (for React Dashboard)
-# --------------------------------------------------------------------------
 class TelemetryStore:
-    """Thread-safe circular telemetry buffer powering the live React 19 dashboard."""
+    """Bounded buffer of recent predictions and latency samples."""
 
-    def __init__(self, maxlen: int = 100) -> None:
-        self.recent_predictions: Deque[Dict] = collections.deque(maxlen=maxlen)
-        self.recent_latencies: Deque[float] = collections.deque(maxlen=maxlen)
+    def __init__(self, maxlen: int = 100, rate_window_seconds: float = 10.0) -> None:
+        self.recent_predictions: collections.deque[dict] = collections.deque(maxlen=maxlen)
+        self.recent_latencies: collections.deque[float] = collections.deque(maxlen=maxlen)
+        self.prediction_times: collections.deque[float] = collections.deque(maxlen=2000)
         self.total_scored: int = 0
         self.total_anomalies: int = 0
+        self.rate_window_seconds = rate_window_seconds
         self._start_time: float = time.time()
 
-    def record_prediction(self, payload_dict: Dict) -> None:
-        """Record an inference event for dashboard streaming."""
+    def record_prediction(self, payload_dict: dict) -> None:
         self.total_scored += 1
         if payload_dict.get("is_anomaly"):
             self.total_anomalies += 1
         self.recent_predictions.appendleft(payload_dict)
         self.recent_latencies.append(payload_dict.get("inference_latency_ms", 0.0))
+        self.prediction_times.append(time.time())
 
-    def get_live_metrics(self) -> Dict:
-        """Summarize current throughput, fraud rate, and latency sparkline points."""
+    def get_live_metrics(self) -> dict:
+        """Return recent throughput, anomaly rate, and latency aggregates."""
         now = time.time()
         uptime = max(now - self._start_time, 1.0)
-        throughput = round(self.total_scored / uptime, 2)
+
+        cutoff = now - self.rate_window_seconds
+        recent_count = sum(1 for recorded_at in self.prediction_times if recorded_at >= cutoff)
+        throughput = round(recent_count / self.rate_window_seconds, 2)
         STREAM_THROUGHPUT_GAUGE.set(throughput)
 
         anomaly_rate = round((self.total_anomalies / max(self.total_scored, 1)) * 100, 2)
@@ -78,6 +77,15 @@ class TelemetryStore:
         lat_list = list(self.recent_latencies)
         avg_lat = round(sum(lat_list) / len(lat_list), 3) if lat_list else 0.0
         p95_lat = round(sorted(lat_list)[min(int(0.95 * len(lat_list)), len(lat_list) - 1)], 3) if lat_list else 0.0
+
+        model_threshold = next(
+            (
+                record["threshold"]
+                for record in self.recent_predictions
+                if record.get("threshold") is not None
+            ),
+            None,
+        )
 
         return {
             "uptime_seconds": round(uptime, 1),
@@ -87,10 +95,10 @@ class TelemetryStore:
             "throughput_tx_per_sec": throughput,
             "avg_latency_ms": avg_lat,
             "p95_latency_ms": p95_lat,
+            "model_threshold": model_threshold,
             "recent_latencies": lat_list[-30:],
             "recent_transactions": list(self.recent_predictions)[:20],
         }
 
 
-# Global telemetry singleton
 telemetry_store = TelemetryStore(maxlen=100)

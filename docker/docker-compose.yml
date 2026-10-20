@@ -1,9 +1,4 @@
-version: '3.8'
-
 services:
-  # ----------------------------------------------------------------------------
-  # Redis Streams Ingestion Backbone
-  # ----------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
     container_name: sentinel-redis
@@ -19,9 +14,6 @@ services:
     networks:
       - sentinel-net
 
-  # ----------------------------------------------------------------------------
-  # FastAPI Production Microservice (Quantized ONNX Runtime)
-  # ----------------------------------------------------------------------------
   api:
     build:
       context: ..
@@ -33,8 +25,10 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - ENVIRONMENT=production
-      - API_WORKERS=4
+      - CORS_ALLOW_ORIGINS=["http://localhost:3000"]
+    volumes:
+      - ../models:/app/models:ro
+      - ../data:/app/data:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -47,9 +41,6 @@ services:
     networks:
       - sentinel-net
 
-  # ----------------------------------------------------------------------------
-  # Streaming Producer (Synthetic & Drift Ingestion)
-  # ----------------------------------------------------------------------------
   producer:
     build:
       context: ..
@@ -61,6 +52,8 @@ services:
       - REDIS_PORT=6379
       - PRODUCER_BATCH_SIZE=50
       - PRODUCER_EMIT_INTERVAL_SEC=0.05
+    volumes:
+      - ../data:/app/data:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -70,9 +63,6 @@ services:
     networks:
       - sentinel-net
 
-  # ----------------------------------------------------------------------------
-  # Streaming Consumer Group Worker
-  # ----------------------------------------------------------------------------
   consumer:
     build:
       context: ..
@@ -84,6 +74,9 @@ services:
       - REDIS_PORT=6379
       - CONSUMER_BATCH_SIZE=100
       - LATENCY_BUDGET_MS=10.0
+    volumes:
+      - ../data:/app/data:ro
+      - ../models:/app/models
     depends_on:
       redis:
         condition: service_healthy
@@ -91,9 +84,6 @@ services:
     networks:
       - sentinel-net
 
-  # ----------------------------------------------------------------------------
-  # MLflow Tracking Server
-  # ----------------------------------------------------------------------------
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.13.0
     container_name: sentinel-mlflow
@@ -111,11 +101,8 @@ services:
     networks:
       - sentinel-net
 
-  # ----------------------------------------------------------------------------
-  # Prometheus Telemetry Collector
-  # ----------------------------------------------------------------------------
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.53.0
     container_name: sentinel-prometheus
     ports:
       - "9090:9090"
@@ -130,11 +117,8 @@ services:
     networks:
       - sentinel-net
 
-  # ----------------------------------------------------------------------------
-  # Grafana Telemetry Dashboard
-  # ----------------------------------------------------------------------------
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.1.0
     container_name: sentinel-grafana
     ports:
       - "3001:3000"

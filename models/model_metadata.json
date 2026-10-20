@@ -3,9 +3,75 @@
   "input_dim": 30,
   "hidden_dim": 16,
   "latent_dim": 8,
-  "anomaly_threshold": 2.2521579837799135,
+  "anomaly_threshold": 2.3571687984466627,
   "percentile": 98.0,
-  "val_mse_mean": 0.46009176732654555,
-  "trained_at": 1792466469.6882389,
-  "train_samples": 227452
+  "val_mse_mean": 0.47658482328098695,
+  "trained_at": 1792494465.7558892,
+  "train_samples": 227452,
+  "evaluation": {
+    "dataset": "creditcard.csv",
+    "evaluated_at": 1792495048.202749,
+    "normal_validation_samples": 56863,
+    "fraud_samples": 492,
+    "pr_auc": 0.4744,
+    "roc_auc": 0.9377,
+    "normal_mse_mean": 0.496236,
+    "fraud_mse_mean": 23.828154,
+    "at_calibrated_threshold": {
+      "threshold": 2.357169,
+      "precision": 0.2573,
+      "recall": 0.8069,
+      "f1": 0.3902,
+      "true_positives": 397,
+      "false_positives": 1146,
+      "true_negatives": 55717,
+      "false_negatives": 95
+    },
+    "sensitivity": [
+      {
+        "threshold": 0.677339,
+        "precision": 0.0698,
+        "recall": 0.8679,
+        "f1": 0.1293,
+        "true_positives": 427,
+        "false_positives": 5687,
+        "true_negatives": 51176,
+        "false_negatives": 65,
+        "percentile": 90.0
+      },
+      {
+        "threshold": 1.087482,
+        "precision": 0.1276,
+        "recall": 0.8455,
+        "f1": 0.2217,
+        "true_positives": 416,
+        "false_positives": 2844,
+        "true_negatives": 54019,
+        "false_negatives": 76,
+        "percentile": 95.0
+      },
+      {
+        "threshold": 2.391279,
+        "precision": 0.2586,
+        "recall": 0.8069,
+        "f1": 0.3917,
+        "true_positives": 397,
+        "false_positives": 1138,
+        "true_negatives": 55725,
+        "false_negatives": 95,
+        "percentile": 98.0
+      },
+      {
+        "threshold": 4.683973,
+        "precision": 0.3747,
+        "recall": 0.6931,
+        "f1": 0.4864,
+        "true_positives": 341,
+        "false_positives": 569,
+        "true_negatives": 56294,
+        "false_negatives": 151,
+        "percentile": 99.0
+      }
+    ]
+  }
 }

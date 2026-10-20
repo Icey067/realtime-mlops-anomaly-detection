@@ -1,12 +1,10 @@
-"""Inference API routes for real-time anomaly detection."""
+"""Inference routes."""
 
 from __future__ import annotations
 
 import logging
-import time
-from typing import List
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from src.api.telemetry import (
     ANOMALY_COUNT_TOTAL,
     HTTP_REQUESTS_TOTAL,
@@ -17,92 +15,101 @@ from src.api.telemetry import (
 from src.model.predictor import get_predictor
 from src.schemas.transaction import AnomalyPredictionResult, TransactionPayload
 
-logger = logging.getLogger("sentinel.api.predict")
-router = APIRouter(prefix="", tags=["Inference"])
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["Inference"])
+
+MAX_BATCH_SIZE = 1000
 
 
 def record_telemetry_background(
     payload: TransactionPayload,
     result: AnomalyPredictionResult,
 ) -> None:
-    """Async background task recording Prometheus metrics and updating the live dashboard buffer."""
-    # Prometheus metric increments
-    decision_label = "anomaly" if result.is_anomaly else "normal"
+    """Update Prometheus metrics and the dashboard buffer after a response is sent."""
+    if result.is_anomaly is None:
+        decision_label = "degraded"
+    else:
+        decision_label = "anomaly" if result.is_anomaly else "normal"
+
     ANOMALY_COUNT_TOTAL.labels(decision=decision_label).inc()
     INFERENCE_LATENCY_SECONDS.observe(result.inference_latency_ms / 1000.0)
-    RECONSTRUCTION_MSE_HISTOGRAM.observe(result.reconstruction_mse)
+    if result.reconstruction_mse is not None:
+        RECONSTRUCTION_MSE_HISTOGRAM.observe(result.reconstruction_mse)
 
-    # Telemetry store update
-    telemetry_item = {
-        "transaction_id": result.transaction_id,
-        "user_id": payload.user_id,
-        "amount": payload.amount,
-        "is_anomaly": result.is_anomaly,
-        "reconstruction_mse": result.reconstruction_mse,
-        "threshold": result.threshold,
-        "inference_latency_ms": result.inference_latency_ms,
-        "timestamp": result.timestamp,
-    }
-    telemetry_store.record_prediction(telemetry_item)
+    telemetry_store.record_prediction(
+        {
+            "transaction_id": result.transaction_id,
+            "user_id": payload.user_id,
+            "amount": payload.amount,
+            "status": result.status,
+            "is_anomaly": result.is_anomaly,
+            "reconstruction_mse": result.reconstruction_mse,
+            "threshold": result.threshold,
+            "inference_latency_ms": result.inference_latency_ms,
+            "timestamp": result.timestamp,
+        }
+    )
 
 
 @router.post(
     "/predict",
     response_model=AnomalyPredictionResult,
     status_code=status.HTTP_200_OK,
-    summary="Real-time transaction anomaly scoring",
-    description="Ingests a validated financial transaction, runs ONNX quantized inference, and flags anomalies exceeding calibrated MSE.",
+    summary="Score one transaction",
 )
 async def predict_transaction(
     payload: TransactionPayload,
     background_tasks: BackgroundTasks,
 ) -> AnomalyPredictionResult:
-    """Score a single incoming transaction."""
-    start_time = time.perf_counter()
+    """Score a transaction and return the reconstruction error and decision."""
     predictor = get_predictor()
 
     try:
         result = predictor.predict_one(payload)
-        HTTP_REQUESTS_TOTAL.labels(method="POST", endpoint="/predict", status="200").inc()
-
-        # Append background task for non-blocking telemetry and metrics logging
-        background_tasks.add_task(record_telemetry_background, payload, result)
-
-        return result
-
     except Exception as exc:
         HTTP_REQUESTS_TOTAL.labels(method="POST", endpoint="/predict", status="500").inc()
-        logger.error("Error during prediction for tx %s: %s", payload.transaction_id, exc)
+        logger.exception("Prediction failed for transaction %s", payload.transaction_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Inference failure: {str(exc)}",
-        )
+            detail="Inference failure",
+        ) from exc
+
+    HTTP_REQUESTS_TOTAL.labels(method="POST", endpoint="/predict", status="200").inc()
+    background_tasks.add_task(record_telemetry_background, payload, result)
+    return result
 
 
 @router.post(
     "/predict/batch",
-    response_model=List[AnomalyPredictionResult],
+    response_model=list[AnomalyPredictionResult],
     status_code=status.HTTP_200_OK,
-    summary="Vectorized batch transaction scoring",
+    summary="Score up to 1000 transactions",
 )
 async def predict_batch_transactions(
-    payloads: List[TransactionPayload],
+    payloads: list[TransactionPayload],
     background_tasks: BackgroundTasks,
-) -> List[AnomalyPredictionResult]:
-    """Score a batch of transactions in a single vectorized ONNX call."""
+) -> list[AnomalyPredictionResult]:
+    """Score a batch in one ONNX call."""
     if not payloads:
         return []
+    if len(payloads) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Batch size {len(payloads)} exceeds the limit of {MAX_BATCH_SIZE}",
+        )
 
     predictor = get_predictor()
     try:
         results = predictor.predict_batch(payloads)
-        HTTP_REQUESTS_TOTAL.labels(method="POST", endpoint="/predict/batch", status="200").inc()
-
-        # Record metrics in background
-        for p, r in zip(payloads, results):
-            background_tasks.add_task(record_telemetry_background, p, r)
-
-        return results
     except Exception as exc:
         HTTP_REQUESTS_TOTAL.labels(method="POST", endpoint="/predict/batch", status="500").inc()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+        logger.exception("Batch prediction failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Inference failure",
+        ) from exc
+
+    HTTP_REQUESTS_TOTAL.labels(method="POST", endpoint="/predict/batch", status="200").inc()
+    for payload, result in zip(payloads, results, strict=False):
+        background_tasks.add_task(record_telemetry_background, payload, result)
+    return results

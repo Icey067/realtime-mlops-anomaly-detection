@@ -1,138 +1,122 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   LineChart, Line, ReferenceLine
 } from 'recharts';
 import {
   ShieldAlert, Activity, Cpu, Database, Zap, RefreshCw, AlertTriangle,
-  CheckCircle2, Flame, ArrowUpRight, Filter, Play, Check
+  Flame, Check
 } from 'lucide-react';
 
-export default function App() {
-  const [metrics, setMetrics] = useState({
-    throughput: 480,
-    p95Latency: 0.42,
-    avgLatency: 0.28,
-    totalScored: 12480,
-    anomalies: 214,
-    anomalyRate: 1.71,
-    driftScore: 0.04,
-    threshold: 1.35,
-    isHealthy: true,
-  });
+const EMPTY_METRICS = {
+  throughput: 0,
+  p95Latency: null,
+  avgLatency: null,
+  totalScored: 0,
+  anomalies: 0,
+  anomalyRate: 0,
+  driftScore: null,
+  driftThreshold: 0.15,
+  threshold: null,
+  uptimeSeconds: 0,
+  redisConnected: false,
+  modelLoaded: false,
+};
 
+function formatUptime(seconds) {
+  const total = Math.max(Math.floor(seconds || 0), 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+export default function App() {
+  const [metrics, setMetrics] = useState(EMPTY_METRICS);
   const [latencyHistory, setLatencyHistory] = useState([]);
   const [transactions, setTransactions] = useState([]);
-  const [filter, setFilter] = useState('ALL'); // ALL | ANOMALY | NORMAL
+  const [filter, setFilter] = useState('ALL');
   const [injecting, setInjecting] = useState(false);
-  const [autoSimulate, setAutoSimulate] = useState(true);
+  const [error, setError] = useState(null);
 
-  // Initialize sparkline buffer
   useEffect(() => {
-    const initialData = Array.from({ length: 30 }, (_, i) => ({
-      time: `${i}s`,
-      latency: Number((0.2 + Math.random() * 0.35).toFixed(3)),
-      mse: Number((0.4 + Math.random() * 0.5).toFixed(3)),
-    }));
-    setLatencyHistory(initialData);
+    let cancelled = false;
 
-    const initialTx = Array.from({ length: 12 }, (_, i) => generateMockTx(i % 5 === 0));
-    setTransactions(initialTx);
-  }, []);
-
-  function generateMockTx(forceAnomaly = false) {
-    const isAnomaly = forceAnomaly || Math.random() < 0.05;
-    const mse = isAnomaly ? 1.45 + Math.random() * 2.2 : 0.2 + Math.random() * 0.7;
-    const latency = Number((0.25 + Math.random() * 0.45).toFixed(2));
-    const amount = Number((10 + Math.random() * (isAnomaly ? 3500 : 450)).toFixed(2));
-
-    return {
-      id: `tx_${Date.now().toString().slice(-6)}_${Math.floor(100 + Math.random() * 900)}`,
-      time: new Date().toLocaleTimeString(),
-      userId: `usr_${Math.floor(100000 + Math.random() * 900000)}`,
-      amount: amount,
-      mse: Number(mse.toFixed(4)),
-      latency: latency,
-      isAnomaly: isAnomaly,
-      location: isAnomaly ? '40.7128, -74.0060 (Abnormal)' : '40.7128, -74.0060',
-    };
-  }
-
-  // Polling / Streaming loop
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      // Try to fetch live metrics from backend API
+    const load = async () => {
       try {
-        const res = await fetch('/api/telemetry/live');
-        if (res.ok) {
-          const data = await res.json();
-          setMetrics(prev => ({
-            ...prev,
-            throughput: data.throughput_tx_per_sec || prev.throughput,
-            p95Latency: data.p95_latency_ms || prev.p95Latency,
-            avgLatency: data.avg_latency_ms || prev.avgLatency,
-            totalScored: data.total_scored || prev.totalScored,
-            anomalies: data.total_anomalies || prev.anomalies,
-            anomalyRate: data.anomaly_rate_percent || prev.anomalyRate,
-            isHealthy: true,
-          }));
-
-          if (data.recent_transactions && data.recent_transactions.length > 0) {
-            setTransactions(data.recent_transactions.map(t => ({
-              id: t.transaction_id,
-              time: new Date(t.timestamp * 1000).toLocaleTimeString(),
-              userId: t.user_id,
-              amount: t.amount,
-              mse: t.reconstruction_mse,
-              latency: t.inference_latency_ms,
-              isAnomaly: t.is_anomaly,
-              location: '40.7128, -74.0060',
-            })));
-          }
+        const [liveResponse, healthResponse] = await Promise.all([
+          fetch('/api/telemetry/live'),
+          fetch('/healthz'),
+        ]);
+        if (!liveResponse.ok) {
+          throw new Error(`Live telemetry returned ${liveResponse.status}`);
         }
+
+        const data = await liveResponse.json();
+        const health = healthResponse.ok ? await healthResponse.json() : null;
+        if (cancelled) return;
+
+        setMetrics({
+          throughput: data.throughput_tx_per_sec ?? 0,
+          p95Latency: data.p95_latency_ms ?? null,
+          avgLatency: data.avg_latency_ms ?? null,
+          totalScored: data.total_scored ?? 0,
+          anomalies: data.total_anomalies ?? 0,
+          anomalyRate: data.anomaly_rate_percent ?? 0,
+          driftScore: typeof data.drift_score === 'number' ? data.drift_score : null,
+          driftThreshold: data.drift_threshold ?? 0.15,
+          threshold: typeof data.model_threshold === 'number' ? data.model_threshold : null,
+          uptimeSeconds: data.uptime_seconds ?? 0,
+          redisConnected: Boolean(health?.redis_connected),
+          modelLoaded: Boolean(health?.model_loaded),
+        });
+
+        if (data.recent_transactions?.length > 0) {
+          setTransactions(data.recent_transactions.map(t => ({
+            id: t.transaction_id,
+            time: new Date(t.timestamp * 1000).toLocaleTimeString(),
+            userId: t.user_id,
+            amount: t.amount,
+            mse: t.reconstruction_mse,
+            latency: t.inference_latency_ms,
+            isAnomaly: t.is_anomaly,
+            status: t.status,
+          })));
+
+          setLatencyHistory([...data.recent_transactions].reverse().map(t => ({
+            time: new Date(t.timestamp * 1000).toLocaleTimeString(),
+            latency: t.inference_latency_ms,
+            mse: t.reconstruction_mse,
+          })));
+        }
+
+        setError(null);
       } catch {
-        // Fallback to active simulation mode for fluid UI preview
-        if (autoSimulate) {
-          const newTx = generateMockTx();
-          setTransactions(prev => [newTx, ...prev.slice(0, 24)]);
-
-          setLatencyHistory(prev => {
-            const next = [...prev.slice(1), {
-              time: newTx.time,
-              latency: newTx.latency,
-              mse: newTx.mse,
-            }];
-            return next;
-          });
-
-          setMetrics(prev => {
-            const nextTotal = prev.totalScored + 1;
-            const nextAnom = prev.anomalies + (newTx.isAnomaly ? 1 : 0);
-            return {
-              ...prev,
-              totalScored: nextTotal,
-              anomalies: nextAnom,
-              anomalyRate: Number(((nextAnom / nextTotal) * 100).toFixed(2)),
-              p95Latency: Number((newTx.latency * 1.35).toFixed(2)),
-              throughput: Math.floor(450 + Math.random() * 80),
-            };
-          });
+        if (!cancelled) {
+          setMetrics(prev => ({ ...prev, redisConnected: false }));
+          setError('Live data unavailable. Showing the last values received from the API.');
         }
       }
-    }, 1200);
+    };
 
-    return () => clearInterval(interval);
-  }, [autoSimulate]);
+    load();
+    const interval = setInterval(load, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
 
-  // Inject manual anomaly transaction
   const triggerManualInjection = async (anomaly = false) => {
     setInjecting(true);
-    const mockPayload = {
+    const payload = {
       transaction_id: `tx_manual_${Date.now()}`,
       timestamp: Date.now() / 1000,
       user_id: `usr_${Math.floor(100000 + Math.random() * 900000)}`,
       amount: anomaly ? 9450.00 : 75.50,
-      currency: "USD",
+      currency: 'USD',
       latitude: 40.7128,
       longitude: -74.0060,
       time_step: 42.0,
@@ -142,39 +126,54 @@ export default function App() {
     };
 
     try {
-      const res = await fetch('/predict', {
+      const response = await fetch('/predict', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(mockPayload),
+        body: JSON.stringify(payload),
       });
-      if (res.ok) {
-        const scored = await res.json();
-        const txRecord = {
-          id: scored.transaction_id,
-          time: new Date().toLocaleTimeString(),
-          userId: mockPayload.user_id,
-          amount: mockPayload.amount,
-          mse: scored.reconstruction_mse,
-          latency: scored.inference_latency_ms,
-          isAnomaly: scored.is_anomaly,
-          location: '40.7128, -74.0060 (Manual)',
-        };
-        setTransactions(prev => [txRecord, ...prev.slice(0, 24)]);
+      if (!response.ok) {
+        throw new Error(`Prediction returned ${response.status}`);
       }
+
+      const scored = await response.json();
+      const transaction = {
+        id: scored.transaction_id,
+        time: new Date().toLocaleTimeString(),
+        userId: payload.user_id,
+        amount: payload.amount,
+        mse: scored.reconstruction_mse,
+        latency: scored.inference_latency_ms,
+        isAnomaly: scored.is_anomaly,
+        status: scored.status,
+      };
+      setTransactions(prev => [transaction, ...prev.slice(0, 24)]);
+      setLatencyHistory(prev => [
+        ...prev.slice(-29),
+        {
+          time: transaction.time,
+          latency: scored.inference_latency_ms,
+          mse: scored.reconstruction_mse,
+        },
+      ]);
+      setError(null);
     } catch {
-      // Local fallback
-      const txRecord = generateMockTx(anomaly);
-      setTransactions(prev => [txRecord, ...prev.slice(0, 24)]);
+      setError('Prediction request failed. Check that the API is running.');
     } finally {
       setTimeout(() => setInjecting(false), 300);
     }
   };
 
   const filteredTransactions = transactions.filter(t => {
-    if (filter === 'ANOMALY') return t.isAnomaly;
-    if (filter === 'NORMAL') return !t.isAnomaly;
+    if (filter === 'ANOMALY') return t.isAnomaly === true;
+    if (filter === 'NORMAL') return t.isAnomaly === false;
     return true;
   });
+
+  const driftStatus = metrics.driftScore === null
+    ? 'Awaiting consumer'
+    : metrics.driftScore > metrics.driftThreshold
+      ? 'Retrain threshold exceeded'
+      : 'Below threshold';
 
   return (
     <div className="min-h-screen bg-[#07090e] text-slate-100 flex flex-col font-sans">
@@ -199,7 +198,7 @@ export default function App() {
                 Real-Time MLOps
               </span>
             </div>
-            <p className="text-xs text-slate-400">High-Frequency Transaction Anomaly Engine (Sub-15ms SLA)</p>
+            <p className="text-xs text-slate-400">Streaming Transaction Anomaly Detection</p>
           </div>
         </div>
 
@@ -208,13 +207,17 @@ export default function App() {
           <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs">
             <Cpu className="w-3.5 h-3.5 text-cyan-400" />
             <span className="text-slate-400">Model:</span>
-            <span className="font-mono text-cyan-300 font-semibold">ONNX INT8</span>
+            <span className={`font-mono font-semibold ${metrics.modelLoaded ? 'text-cyan-300' : 'text-amber-300'}`}>
+              {metrics.modelLoaded ? 'ONNX INT8' : 'Not loaded'}
+            </span>
           </div>
 
           <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs">
             <Database className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="text-slate-400">Ingest:</span>
-            <span className="font-mono text-emerald-300 font-semibold">Redis Streams</span>
+            <span className="text-slate-400">Redis:</span>
+            <span className={`font-mono font-semibold ${metrics.redisConnected ? 'text-emerald-300' : 'text-amber-300'}`}>
+              {metrics.redisConnected ? 'Connected' : 'Unavailable'}
+            </span>
           </div>
 
           <button
@@ -240,6 +243,11 @@ export default function App() {
 
       {/* Main Content Dashboard */}
       <main className="flex-1 p-6 max-w-7xl w-full mx-auto space-y-6">
+        {error && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-4 py-3 text-xs text-amber-200">
+            {error}
+          </div>
+        )}
         {/* KPI Cards Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {/* 1. Throughput */}
@@ -255,10 +263,8 @@ export default function App() {
               <span className="text-xs font-medium text-slate-400">tx / sec</span>
             </div>
             <div className="mt-3 flex items-center justify-between text-xs text-slate-400">
-              <span>Streaming Pipeline</span>
-              <span className="text-emerald-400 font-semibold flex items-center gap-1">
-                <CheckCircle2 className="w-3 h-3" /> 100% In Budget
-              </span>
+              <span>Last 10s</span>
+              <span className="font-mono text-slate-300">Uptime {formatUptime(metrics.uptimeSeconds)}</span>
             </div>
           </div>
 
@@ -275,8 +281,10 @@ export default function App() {
               <span className="text-xs font-medium text-slate-400">ms</span>
             </div>
             <div className="mt-3 flex items-center justify-between text-xs text-slate-400">
-              <span>SLA Target: &lt;15.00ms</span>
-              <span className="text-cyan-400 font-semibold">97.2% Margin</span>
+              <span>Last {latencyHistory.length} predictions</span>
+              <span className={metrics.p95Latency === null ? 'text-slate-500' : 'text-cyan-400 font-semibold'}>
+                {metrics.p95Latency === null ? 'No samples' : 'Measured'}
+              </span>
             </div>
           </div>
 
@@ -298,36 +306,38 @@ export default function App() {
             </div>
           </div>
 
-          {/* 4. Evidently AI Drift Score */}
+          {/* 4. Feature Drift Score */}
           <div className="glass-panel rounded-xl p-4 relative overflow-hidden group hover:border-cyan-500/30 transition">
             <div className="flex items-center justify-between text-slate-400 mb-2">
-              <span className="text-xs uppercase tracking-wider font-medium">Evidently Data Drift</span>
+              <span className="text-xs uppercase tracking-wider font-medium">Feature Drift Score</span>
               <RefreshCw className="w-4 h-4 text-indigo-400" />
             </div>
             <div className="flex items-baseline gap-2">
               <span className="text-3xl font-extrabold tracking-tight font-mono text-indigo-300">
-                {metrics.driftScore.toFixed(3)}
+                {metrics.driftScore === null ? '—' : metrics.driftScore.toFixed(3)}
               </span>
-              <span className="text-xs font-medium text-slate-400">KS Score</span>
+              <span className="text-xs font-medium text-slate-400">KS / Wasserstein</span>
             </div>
             <div className="mt-3 flex items-center justify-between text-xs text-slate-400">
-              <span>Retrain Threshold: &gt;0.15</span>
-              <span className="text-emerald-400 font-semibold">Distribution Stable</span>
+              <span>Alert threshold: &gt;{metrics.driftThreshold.toFixed(2)}</span>
+              <span className={metrics.driftScore === null ? 'text-slate-500' : 'text-cyan-400 font-semibold'}>
+                {driftStatus}
+              </span>
             </div>
           </div>
         </div>
 
         {/* Charts Section */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Sub-15ms Latency Sparkline */}
+          {/* Inference latency */}
           <div className="glass-panel rounded-xl p-5 flex flex-col">
             <div className="flex items-center justify-between mb-4">
               <div>
-                <h3 className="text-sm font-semibold text-slate-200">Real-Time Inference Latency Sparkline</h3>
-                <p className="text-xs text-slate-400">Quantized ONNX CPU Execution Time (SLA: 15ms)</p>
+                <h3 className="text-sm font-semibold text-slate-200">Real-Time Inference Latency</h3>
+                <p className="text-xs text-slate-400">Quantized ONNX CPU execution time</p>
               </div>
               <span className="text-xs font-mono px-2 py-0.5 rounded bg-cyan-950/80 border border-cyan-800 text-cyan-300">
-                Avg: {metrics.avgLatency}ms
+                Avg: {metrics.avgLatency === null ? '—' : `${metrics.avgLatency}ms`}
               </span>
             </div>
             <div className="h-48 w-full">
@@ -340,12 +350,11 @@ export default function App() {
                     </linearGradient>
                   </defs>
                   <XAxis dataKey="time" hide />
-                  <YAxis domain={[0, 2.0]} stroke="#475569" fontSize={11} tickFormatter={v => `${v}ms`} />
+                  <YAxis domain={[0, 'auto']} stroke="#475569" fontSize={11} tickFormatter={v => `${v}ms`} />
                   <Tooltip
                     contentStyle={{ backgroundColor: '#0c1017', borderColor: '#334155', borderRadius: 8 }}
                     itemStyle={{ color: '#00f2fe' }}
                   />
-                  <ReferenceLine y={15.0} stroke="#f43f5e" strokeDasharray="3 3" label={{ value: '15ms SLA', fill: '#f43f5e', fontSize: 10 }} />
                   <Area type="monotone" dataKey="latency" stroke="#00f2fe" strokeWidth={2} fillOpacity={1} fill="url(#latencyGradient)" />
                 </AreaChart>
               </ResponsiveContainer>
@@ -360,19 +369,21 @@ export default function App() {
                 <p className="text-xs text-slate-400">Cutoff threshold calibrated at 98th percentile</p>
               </div>
               <span className="text-xs font-mono px-2 py-0.5 rounded bg-rose-950/80 border border-rose-800 text-rose-300">
-                Cutoff: {metrics.threshold.toFixed(2)}
+                Cutoff: {metrics.threshold === null ? '—' : metrics.threshold.toFixed(2)}
               </span>
             </div>
             <div className="h-48 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={latencyHistory} margin={{ top: 5, right: 10, left: -25, bottom: 0 }}>
                   <XAxis dataKey="time" hide />
-                  <YAxis domain={[0, 4.0]} stroke="#475569" fontSize={11} />
+                  <YAxis domain={[0, 'auto']} stroke="#475569" fontSize={11} />
                   <Tooltip
                     contentStyle={{ backgroundColor: '#0c1017', borderColor: '#334155', borderRadius: 8 }}
                     itemStyle={{ color: '#a78bfa' }}
                   />
-                  <ReferenceLine y={metrics.threshold} stroke="#f43f5e" strokeDasharray="4 4" label={{ value: 'Anomaly Threshold (98%)', fill: '#f43f5e', fontSize: 10 }} />
+                  {metrics.threshold !== null && (
+                    <ReferenceLine y={metrics.threshold} stroke="#f43f5e" strokeDasharray="4 4" label={{ value: 'Anomaly Threshold (98%)', fill: '#f43f5e', fontSize: 10 }} />
+                  )}
                   <Line type="monotone" dataKey="mse" stroke="#a78bfa" strokeWidth={2} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
@@ -385,7 +396,7 @@ export default function App() {
           <div className="p-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3 bg-[#0c1017]/60">
             <div className="flex items-center gap-2">
               <Activity className="w-4 h-4 text-cyan-400" />
-              <h3 className="text-sm font-semibold text-white">Active Redis Stream Events</h3>
+              <h3 className="text-sm font-semibold text-white">Recent API Predictions</h3>
               <span className="text-xs text-slate-400 font-mono">({filteredTransactions.length} rendered)</span>
             </div>
 
@@ -435,12 +446,18 @@ export default function App() {
                     <td className="py-2.5 px-4 text-cyan-300 font-medium">{tx.id}</td>
                     <td className="py-2.5 px-4 text-slate-300">{tx.userId}</td>
                     <td className="py-2.5 px-4 text-right text-white font-medium">${tx.amount.toFixed(2)}</td>
-                    <td className={`py-2.5 px-4 text-right font-semibold ${tx.isAnomaly ? 'text-rose-400' : 'text-slate-300'}`}>
-                      {tx.mse.toFixed(4)}
+                    <td className={`py-2.5 px-4 text-right font-semibold ${tx.isAnomaly === true ? 'text-rose-400' : 'text-slate-300'}`}>
+                      {tx.mse === null || tx.mse === undefined ? '—' : tx.mse.toFixed(4)}
                     </td>
-                    <td className="py-2.5 px-4 text-right text-emerald-400">{tx.latency}ms</td>
+                    <td className="py-2.5 px-4 text-right text-emerald-400">
+                      {tx.latency === null || tx.latency === undefined ? '—' : `${tx.latency}ms`}
+                    </td>
                     <td className="py-2.5 px-4 text-center">
-                      {tx.isAnomaly ? (
+                      {tx.isAnomaly === null || tx.isAnomaly === undefined ? (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                          <AlertTriangle className="w-2.5 h-2.5" /> DEGRADED
+                        </span>
+                      ) : tx.isAnomaly ? (
                         <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse">
                           <AlertTriangle className="w-2.5 h-2.5" /> FRAUD DETECTED
                         </span>
@@ -452,6 +469,13 @@ export default function App() {
                     </td>
                   </tr>
                 ))}
+                {filteredTransactions.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="py-8 px-4 text-center text-slate-500 font-sans">
+                      No predictions yet. Send a request to /predict or inject a transaction.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -461,15 +485,23 @@ export default function App() {
       {/* Footer Status Bar */}
       <footer className="border-t border-white/10 bg-[#0c1017] px-6 py-3 text-xs text-slate-400 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4">
-          <span className="flex items-center gap-1.5 text-emerald-400 font-medium">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            Redis Cluster Connected
+          <span className={`flex items-center gap-1.5 font-medium ${metrics.redisConnected ? 'text-emerald-400' : 'text-amber-400'}`}>
+            <span className={`w-2 h-2 rounded-full ${metrics.redisConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></span>
+            {metrics.redisConnected ? 'Redis connected' : 'Redis unavailable'}
           </span>
           <span className="text-slate-600">|</span>
-          <span>Inference Runtime: <span className="text-slate-200 font-mono">ONNX Runtime 1.31 (Dynamic INT8)</span></span>
+          <span className={error ? 'text-amber-400' : 'text-emerald-400'}>
+            {error ? 'API unavailable' : 'API connected'}
+          </span>
+          <span className="text-slate-600">|</span>
+          <span>
+            Model: <span className="text-slate-200 font-mono">
+              {metrics.modelLoaded ? 'ONNX INT8 loaded' : 'degraded'}
+            </span>
+          </span>
         </div>
         <div className="flex items-center gap-3">
-          <span>Sentinel MLOps v1.0.0</span>
+          <span>Sentinel v1.0.0</span>
         </div>
       </footer>
     </div>

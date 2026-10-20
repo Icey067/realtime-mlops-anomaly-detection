@@ -1,14 +1,12 @@
-"""Unit tests for Phase 1: Configuration, Schema Validation, and Ingestion Serialization."""
+"""Tests for configuration and transaction schemas."""
 
 import pytest
 from pydantic import ValidationError
-
 from src.config import get_settings
 from src.schemas.transaction import TransactionPayload
 
 
 def test_settings_loaded() -> None:
-    """Verify settings singleton loads with correct defaults."""
     settings = get_settings()
     assert settings.APP_NAME == "Sentinel-MLOps-Anomaly-Engine"
     assert settings.REDIS_STREAM_KEY == "transactions:stream"
@@ -17,12 +15,17 @@ def test_settings_loaded() -> None:
     assert settings.LATENCY_BUDGET_MS == 10.0
 
 
+def test_settings_paths_match_files_on_disk() -> None:
+    settings = get_settings()
+    assert settings.BASELINE_DATA_PATH.suffix == ".csv"
+    assert settings.BASELINE_DATA_PATH.name == "baseline_distribution.csv"
+
+
 def test_transaction_payload_valid() -> None:
-    """Verify TransactionPayload instantiates and validates correct bounds."""
     tx = TransactionPayload(
         user_id="usr_12345",
         amount=250.75,
-        currency="usd",  # should be capitalized by validator
+        currency="usd",
         latitude=40.7128,
         longitude=-74.0060,
         time_step=12.5,
@@ -32,51 +35,25 @@ def test_transaction_payload_valid() -> None:
     assert tx.currency == "USD"
     assert tx.amount == 250.75
     assert len(tx.to_feature_vector()) == 30
-    assert tx.to_feature_vector()[0] == 12.5  # time_step
-    assert tx.to_feature_vector()[-1] == 250.75  # amount
+    assert tx.to_feature_vector()[0] == 12.5
+    assert tx.to_feature_vector()[-1] == 250.75
 
 
 def test_transaction_payload_strict_bounds() -> None:
-    """Verify out-of-bounds amounts and coordinates trigger ValidationError."""
-    # Negative amount
     with pytest.raises(ValidationError):
-        TransactionPayload(
-            user_id="usr_123",
-            amount=-10.0,
-            latitude=0.0,
-            longitude=0.0,
-        )
+        TransactionPayload(user_id="usr_123", amount=-10.0, latitude=0.0, longitude=0.0)
 
-    # Excessive amount (> 1,000,000)
     with pytest.raises(ValidationError):
-        TransactionPayload(
-            user_id="usr_123",
-            amount=1_000_001.0,
-            latitude=0.0,
-            longitude=0.0,
-        )
+        TransactionPayload(user_id="usr_123", amount=1_000_001.0, latitude=0.0, longitude=0.0)
 
-    # Out-of-bounds latitude (> 90.0)
     with pytest.raises(ValidationError):
-        TransactionPayload(
-            user_id="usr_123",
-            amount=100.0,
-            latitude=95.0,
-            longitude=0.0,
-        )
+        TransactionPayload(user_id="usr_123", amount=100.0, latitude=95.0, longitude=0.0)
 
-    # Out-of-bounds longitude (< -180.0)
     with pytest.raises(ValidationError):
-        TransactionPayload(
-            user_id="usr_123",
-            amount=100.0,
-            latitude=0.0,
-            longitude=-185.0,
-        )
+        TransactionPayload(user_id="usr_123", amount=100.0, latitude=0.0, longitude=-185.0)
 
 
 def test_redis_serialization_roundtrip() -> None:
-    """Verify to_redis_dict and from_redis_dict roundtrip fidelity."""
     original = TransactionPayload(
         transaction_id="tx_test_999",
         user_id="usr_abc",
@@ -93,7 +70,6 @@ def test_redis_serialization_roundtrip() -> None:
     assert isinstance(redis_dict["amount"], str)
     assert redis_dict["amount"] == "99.99"
 
-    # Test restoration with bytes keys and values as returned by raw Redis
     redis_raw_bytes = {k.encode("utf-8"): v.encode("utf-8") for k, v in redis_dict.items()}
     restored = TransactionPayload.from_redis_dict(redis_raw_bytes)
 

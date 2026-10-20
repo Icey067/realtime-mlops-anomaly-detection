@@ -1,10 +1,4 @@
-"""PyTorch Autoencoder for unsupervised anomaly detection on financial transactions.
-
-Architecture:
-  - Input: 30 features (Time, V1..V28, Amount)
-  - Encoder: 30 -> 16 -> 8 (Latent bottleneck)
-  - Decoder: 8 -> 16 -> 30 (Reconstruction)
-"""
+"""Autoencoder with a 30 -> 16 -> 8 -> 16 -> 30 topology."""
 
 from __future__ import annotations
 
@@ -13,7 +7,7 @@ import torch.nn as nn
 
 
 class Autoencoder(nn.Module):
-    """Deep autoencoder with LeakyReLU activations and latent bottleneck representation."""
+    """Reconstructs 30-dimensional transactions through an 8-dimensional bottleneck."""
 
     def __init__(
         self,
@@ -27,7 +21,6 @@ class Autoencoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
-        # Encoder: 30 -> 16 -> 8
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -36,7 +29,6 @@ class Autoencoder(nn.Module):
             nn.LeakyReLU(negative_slope=0.1),
         )
 
-        # Decoder: 8 -> 16 -> 30
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -45,20 +37,16 @@ class Autoencoder(nn.Module):
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Project input vector to latent bottleneck representation."""
         return self.encoder(x)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Reconstruct original feature space from latent representation."""
         return self.decoder(z)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Complete forward pass: input -> bottleneck -> reconstruction."""
-        z = self.encode(x)
-        return self.decode(z)
+        return self.decode(self.encode(x))
 
     def compute_reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute per-sample Mean Squared Error (MSE) reconstruction loss."""
+        """Return per-sample MSE between input and reconstruction."""
         self.eval()
         with torch.no_grad():
             reconstructed = self.forward(x)

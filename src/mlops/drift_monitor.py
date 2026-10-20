@@ -1,18 +1,10 @@
-"""Statistical data drift engine powered by Kolmogorov-Smirnov and Wasserstein distance metrics.
-
-Collects rolling production prediction payloads and evaluates statistical distribution divergence
-against the baseline training dataset. Emits alerts when drift score exceeds 0.15.
-"""
+"""Distribution drift detection using two-sample KS tests and Wasserstein distance."""
 
 from __future__ import annotations
 
 import collections
-import json
 import logging
-import os
-import time
-from pathlib import Path
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
@@ -22,119 +14,108 @@ from src.api.telemetry import DATA_DRIFT_SCORE_GAUGE
 from src.config import Settings, get_settings
 from src.schemas.telemetry import DriftAlertPayload
 
-logger = logging.getLogger("sentinel.drift")
+logger = logging.getLogger(__name__)
+
+FEATURE_NAMES = ["Time"] + [f"V{i}" for i in range(1, 29)] + ["Amount"]
+MIN_SAMPLES = 100
+MAX_BASELINE_SAMPLES = 2000
 
 
 class DataDriftMonitor:
-    """Rolling data drift engine comparing inference stream features with baseline distributions."""
+    """Compares recent inference features against a baseline dataset."""
 
     def __init__(
         self,
-        settings: Optional[Settings] = None,
-        on_drift_alert: Optional[Callable[[DriftAlertPayload], None]] = None,
+        settings: Settings | None = None,
+        on_drift_alert: Callable[[DriftAlertPayload], None] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.on_drift_alert = on_drift_alert
         self.window_size = self.settings.DRIFT_WINDOW_SIZE
         self.drift_threshold = self.settings.DRIFT_SCORE_THRESHOLD
 
-        # Feature buffer for rolling inference samples
-        self.feature_buffer: Deque[List[float]] = collections.deque(maxlen=self.window_size)
-        self.baseline_df: Optional[pd.DataFrame] = None
-        self.feature_names: List[str] = ["Time"] + [f"V{i}" for i in range(1, 29)] + ["Amount"]
+        self.feature_buffer: collections.deque[list[float]] = collections.deque(maxlen=self.window_size)
+        self.baseline_df: pd.DataFrame | None = None
+        self.feature_names: list[str] = FEATURE_NAMES
 
         self._load_baseline()
 
     def _load_baseline(self) -> None:
-        """Load baseline distribution from parquet or CSV."""
-        if self.settings.BASELINE_DATA_PATH.exists():
+        """Load the baseline distribution, falling back to the labeled dataset."""
+        for path in (self.settings.BASELINE_DATA_PATH, self.settings.DATASET_PATH):
+            if not path.exists():
+                continue
             try:
-                self.baseline_df = pd.read_parquet(self.settings.BASELINE_DATA_PATH)
-                logger.info("Loaded baseline data from parquet: %s", self.settings.BASELINE_DATA_PATH)
-            except Exception as e:
-                logger.warning("Failed loading baseline parquet: %s", e)
+                frame = pd.read_csv(path)
+                missing = [column for column in self.feature_names if column not in frame.columns]
+                if missing:
+                    logger.warning("Baseline %s is missing columns %s", path, missing)
+                    continue
+                self.baseline_df = frame
+                logger.info("Loaded drift baseline from %s (%d rows)", path, len(frame))
+                return
+            except Exception:
+                logger.exception("Could not read drift baseline %s", path)
 
-        if self.baseline_df is None:
-            csv_baseline = self.settings.BASELINE_DATA_PATH.with_suffix(".csv")
-            if csv_baseline.exists():
-                try:
-                    self.baseline_df = pd.read_csv(csv_baseline)
-                    logger.info("Loaded baseline data from CSV: %s", csv_baseline)
-                except Exception as e:
-                    logger.warning("Failed loading baseline CSV: %s", e)
+        logger.warning("No usable drift baseline found; drift checks will be skipped")
 
-        if self.baseline_df is None and self.settings.DATASET_PATH.exists():
-            try:
-                self.baseline_df = pd.read_csv(self.settings.DATASET_PATH)
-                logger.info("Loaded baseline data from dataset CSV: %s", self.settings.DATASET_PATH)
-            except Exception as e:
-                logger.warning("Failed loading baseline CSV: %s", e)
-
-    def record_inference_features(self, feature_vec: List[float]) -> None:
-        """Append a 30-dimensional feature vector to the rolling production buffer."""
+    def record_inference_features(self, feature_vec: list[float]) -> None:
+        """Append a raw 30-feature vector to the rolling buffer."""
         if len(feature_vec) == self.settings.FEATURE_DIM:
-            self.feature_buffer.append(feature_vec)
+            self.feature_buffer.append(list(feature_vec))
 
-    def compute_drift(self) -> Tuple[float, List[str], Dict[str, Dict[str, float]]]:
-        """Compute 2-sample Kolmogorov-Smirnov test and Wasserstein distance per feature.
+    def compute_drift(self) -> tuple[float, list[str], dict[str, dict[str, float]]]:
+        """Return the drift score, drifted feature names, and per-feature statistics.
 
-        Returns:
-            Tuple of:
-              - overall_drift_score (fraction of features drifted, 0.0 to 1.0)
-              - list of drifted feature names
-              - per-feature metric dictionary
+        The score is the fraction of features whose KS p-value is below 0.01 and
+        whose normalized Wasserstein distance exceeds 0.20.
         """
-        if len(self.feature_buffer) < 100:
-            logger.info("Insufficient production samples for drift analysis (%d / 100 minimum)", len(self.feature_buffer))
+        if len(self.feature_buffer) < MIN_SAMPLES:
+            logger.debug("Not enough samples for drift analysis (%d/%d)", len(self.feature_buffer), MIN_SAMPLES)
             return 0.0, [], {}
 
         if self.baseline_df is None:
-            logger.warning("No baseline dataset available for drift calculation.")
             return 0.0, [], {}
 
-        current_arr = np.array(self.feature_buffer, dtype=np.float32)
-        drifted_features: List[str] = []
-        feature_metrics: Dict[str, Dict[str, float]] = {}
+        current = np.asarray(self.feature_buffer, dtype=np.float32)
+        baseline = self.baseline_df[self.feature_names].sample(
+            n=min(len(self.baseline_df), MAX_BASELINE_SAMPLES),
+            random_state=42,
+        )
 
-        # Subsample baseline if large
-        baseline_sample_size = min(len(self.baseline_df), 2000)
-        baseline_sub = self.baseline_df[self.feature_names].sample(n=baseline_sample_size, random_state=42)
+        drifted_features: list[str] = []
+        feature_metrics: dict[str, dict[str, float]] = {}
 
-        for idx, col in enumerate(self.feature_names):
-            base_col = baseline_sub[col].values
-            curr_col = current_arr[:, idx]
+        for index, column in enumerate(self.feature_names):
+            baseline_values = baseline[column].to_numpy()
+            current_values = current[:, index]
 
-            # 1. Kolmogorov-Smirnov 2-sample test
-            ks_stat, p_value = stats.ks_2samp(base_col, curr_col)
+            ks_stat, p_value = stats.ks_2samp(baseline_values, current_values)
+            baseline_std = float(np.std(baseline_values))
+            wasserstein = stats.wasserstein_distance(baseline_values, current_values) / (
+                baseline_std if baseline_std > 1e-6 else 1.0
+            )
 
-            # 2. Wasserstein Distance (normalized by baseline std)
-            base_std = np.std(base_col)
-            denom = base_std if base_std > 1e-6 else 1.0
-            w_dist = stats.wasserstein_distance(base_col, curr_col) / denom
+            drifted = bool(p_value < 0.01 and wasserstein > 0.20)
+            if drifted:
+                drifted_features.append(column)
 
-            is_feature_drifted = (p_value < 0.01) and (w_dist > 0.20)
-            if is_feature_drifted:
-                drifted_features.append(col)
-
-            feature_metrics[col] = {
+            feature_metrics[column] = {
                 "ks_stat": round(float(ks_stat), 4),
                 "p_value": round(float(p_value), 5),
-                "wasserstein_distance": round(float(w_dist), 4),
-                "drifted": is_feature_drifted,
+                "wasserstein_distance": round(float(wasserstein), 4),
+                "drifted": drifted,
             }
 
-        # Overall drift score: proportion of features exhibiting drift
         overall_score = len(drifted_features) / len(self.feature_names)
         DATA_DRIFT_SCORE_GAUGE.set(overall_score)
-
         logger.info(
-            "Drift Evaluation: Overall Score: %.3f (Threshold: %.2f) | Drifted Features: %s",
+            "Drift score %.3f (threshold %.2f); drifted features: %s",
             overall_score,
             self.drift_threshold,
             drifted_features,
         )
 
-        # Trigger alert if drift score breaches threshold
         if overall_score > self.drift_threshold:
             alert = DriftAlertPayload(
                 drift_score=round(overall_score, 4),
@@ -144,10 +125,9 @@ class DataDriftMonitor:
                 retrigger_training=True,
             )
             logger.critical(
-                "[DATA DRIFT ALERT] Production stream drift score (%.3f) exceeds threshold (%.2f)! Features: %s",
+                "Drift threshold exceeded (%.3f > %.2f)",
                 overall_score,
                 self.drift_threshold,
-                drifted_features,
             )
             if self.on_drift_alert:
                 self.on_drift_alert(alert)

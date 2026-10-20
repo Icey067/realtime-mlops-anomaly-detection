@@ -25,8 +25,6 @@ env/
 venv/
 ENV/
 
-.md
-
 # Data & Models
 data/*.csv
 data/*.parquet

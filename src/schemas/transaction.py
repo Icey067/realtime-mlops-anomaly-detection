@@ -1,24 +1,17 @@
-"""Pydantic v2 schemas for transaction ingestion, validation, and feature vector extraction.
-
-Provides strict bounds on amounts, geo-coordinates, timestamp validations, and zero-copy/low-overhead
-serialization for Redis Streams and downstream ONNX inference.
-"""
+"""Transaction and prediction schemas used by the API and stream workers."""
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
-from typing import Any, Dict, List, Mapping, Optional, Union
+from collections.abc import Mapping
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TransactionPayload(BaseModel):
-    """Production Pydantic v2 transaction payload schema with strict validation bounds.
-
-    Represents a high-frequency financial transaction containing metadata, geo-coordinates,
-    and 28 anonymized PCA features (V1-V28) aligned with Kaggle Credit Card Fraud standards.
-    """
+    """Validated transaction payload with Kaggle-compatible feature fields."""
 
     model_config = ConfigDict(
         frozen=True,
@@ -66,7 +59,6 @@ class TransactionPayload(BaseModel):
         },
     )
 
-    # Metadata & Identifiers
     transaction_id: str = Field(
         default_factory=lambda: f"tx_{uuid.uuid4()}",
         min_length=5,
@@ -85,7 +77,6 @@ class TransactionPayload(BaseModel):
         description="Encrypted or anonymized user account identifier",
     )
 
-    # Core Transaction Features
     amount: float = Field(
         ...,
         gt=0.0,
@@ -99,7 +90,6 @@ class TransactionPayload(BaseModel):
         description="ISO 4217 3-letter currency code",
     )
 
-    # Geo-Spatial Coordinates (Strictly Bounded)
     latitude: float = Field(
         ...,
         ge=-90.0,
@@ -113,7 +103,6 @@ class TransactionPayload(BaseModel):
         description="Longitude of transaction origin (-180 to +180 degrees)",
     )
 
-    # Kaggle Feature Alignments: Time offset & V1 to V28 PCA components
     time_step: float = Field(
         default=0.0,
         ge=0.0,
@@ -152,14 +141,10 @@ class TransactionPayload(BaseModel):
     @field_validator("currency")
     @classmethod
     def validate_currency_uppercase(cls, val: str) -> str:
-        """Enforce standard uppercase ISO currency."""
         return val.upper()
 
-    def to_feature_vector(self) -> List[float]:
-        """Extract exact 30-dimensional float feature vector for model input.
-
-        Format: [time_step, v1, v2, ..., v28, amount] (30 features).
-        """
+    def to_feature_vector(self) -> list[float]:
+        """Return [time_step, v1..v28, amount] as a 30-element list."""
         return [
             self.time_step,
             self.v1,
@@ -193,26 +178,18 @@ class TransactionPayload(BaseModel):
             self.amount,
         ]
 
-    def to_redis_dict(self) -> Dict[str, str]:
-        """Convert payload to string-keyed dictionary suitable for Redis Stream XADD.
-
-        Uses compact JSON serialization for complex fields or direct scalar mapping.
-        """
-        data = self.model_dump()
-        return {k: str(v) for k, v in data.items()}
+    def to_redis_dict(self) -> dict[str, str]:
+        """Return a string-valued mapping suitable for Redis XADD."""
+        return {k: str(v) for k, v in self.model_dump().items()}
 
     @classmethod
-    def from_redis_dict(cls, raw: Mapping[Union[str, bytes], Union[str, bytes]]) -> "TransactionPayload":
-        """Reconstruct validated TransactionPayload from Redis Stream message dict.
-
-        Handles both bytes and string keys/values gracefully.
-        """
-        decoded: Dict[str, Any] = {}
+    def from_redis_dict(cls, raw: Mapping[str | bytes, str | bytes]) -> TransactionPayload:
+        """Rebuild a payload from a Redis stream message, accepting bytes or str values."""
+        decoded: dict[str, Any] = {}
         for k, v in raw.items():
             key = k.decode("utf-8") if isinstance(k, bytes) else str(k)
             val = v.decode("utf-8") if isinstance(v, bytes) else str(v)
 
-            # Cast known numeric types
             if key in {"amount", "latitude", "longitude", "timestamp", "time_step"} or key.startswith("v"):
                 try:
                     decoded[key] = float(val)
@@ -225,12 +202,17 @@ class TransactionPayload(BaseModel):
 
 
 class AnomalyPredictionResult(BaseModel):
-    """Model output payload containing anomaly score, flag, and latency metrics."""
+    """Result of scoring one transaction.
+
+    ``status`` is ``"OK"`` for a real prediction and ``"DEGRADED"`` when the model
+    or scaler is unavailable. Degraded results have no anomaly decision.
+    """
 
     transaction_id: str
-    is_anomaly: bool
-    reconstruction_mse: float
-    threshold: float
+    status: str = "OK"
+    is_anomaly: bool | None = None
+    reconstruction_mse: float | None = None
+    threshold: float | None = None
     inference_latency_ms: float
     timestamp: float = Field(default_factory=time.time)
     drift_detected: bool = False
