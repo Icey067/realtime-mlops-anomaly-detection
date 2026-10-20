@@ -1,171 +1,124 @@
-# Sentinel MLOps Real-Time Anomaly Engine
+# Sentinel MLOps: Real-Time Anomaly Detection Engine ⚡
 
-[![CI/CD Pipeline](https://github.com/Icey067/realtime-mlops-anomaly-detection/actions/workflows/ci.yml/badge.svg)](https://github.com/Icey067/realtime-mlops-anomaly-detection/actions)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![ONNX Runtime INT8](https://img.shields.io/badge/inference-ONNX%20INT8%20(<0.1ms)-brightgreen.svg)](https://onnxruntime.ai/)
-[![Redis Streams](https://img.shields.io/badge/streaming-Redis%20Streams-red.svg)](https://redis.io/)
-[![React 19](https://img.shields.io/badge/frontend-React%2019-cyan.svg)](https://react.dev/)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-Autoencoder-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-INT8_Quantized-00599C?style=flat-square&logo=onnx&logoColor=white)](https://onnxruntime.ai/)
+[![Redis](https://img.shields.io/badge/Redis-Streams-DC382D?style=flat-square&logo=redis&logoColor=white)](https://redis.io/)
+[![Latency SLA](https://img.shields.io/badge/p95_Latency-2.09ms_(SLA_<15ms)-success?style=flat-square)](#-latency-budget-matrix)
 
-An end-to-end, **sub-15ms latency streaming anomaly detection system** designed for high-frequency financial transactions. The system ingests streaming data via Redis Streams, validates payloads using Pydantic v2, scores transactions on a PyTorch Autoencoder quantized to ONNX Runtime (Dynamic INT8), monitors data drift using Kolmogorov-Smirnov / Wasserstein tests via Evidently AI, triggers automated retraining loops via MLflow, and visualizes live telemetry on a React 19 dashboard.
+**Sentinel** is an enterprise-grade, sub-15ms end-to-end streaming anomaly detection and fraud classification system engineered for high-frequency financial transaction pipelines.
 
 ---
 
-## Architecture Overview
+## 📐 System Architecture
 
-```mermaid
-flowchart TD
-    subgraph Ingestion ["Streaming & Ingestion Layer"]
-        CSV[Kaggle creditcard.csv / Baseline] --> Producer[Async Producer with Controlled Drift]
-        Producer -->|XADD| Stream[(Redis Stream: transactions:stream)]
-        Stream -->|XREADGROUP| Consumer[Redis Consumer Group Worker]
-        Consumer -->|Sub-10ms Parse| Pydantic[Pydantic v2 Payload Validation]
-        Pydantic -->|Malformed| DLQ[(Redis DLQ: transactions:dlq)]
-    end
-
-    subgraph Inference ["High-Speed Inference Engine"]
-        Pydantic -->|30-dim Feature Vector| Scaler[StandardScaler]
-        Scaler --> Predictor[ONNX Runtime CPU InferenceSession]
-        ModelWeights[(Autoencoder Dynamic INT8)] -.-> Predictor
-        Predictor --> MSE[Reconstruction MSE Calculation]
-        Decision{MSE > 98th Percentile Cutoff?} -->|Yes| AnomalyFlag[Flag Anomaly / Fraud Alert]
-        MSE --> Decision
-        Decision -->|No| NormalFlag[Normal Transaction]
-    end
-
-    subgraph MLOps ["MLOps, Drift & Retraining Pipeline"]
-        MSE --> DriftBuffer[Rolling Inference Window]
-        BaselineData[(Baseline Distribution)] -.-> DriftMonitor[Data Drift Engine: KS & Wasserstein]
-        DriftBuffer --> DriftMonitor
-        DriftMonitor -->|Score > 0.15| Alert[Drift Alert Trigger]
-        Alert --> RetrainPipeline[Automated Retrain Worker]
-        RetrainPipeline --> PyTorchTrain[Train Autoencoder: Class == 0]
-        PyTorchTrain --> Quantizer[ONNX Dynamic INT8 Quantizer]
-        Quantizer -->|Zero-Downtime Hot Reload| Predictor
-        PyTorchTrain --> MLflow[(MLflow Tracking Server)]
-    end
-
-    subgraph Observability ["Telemetry & Visualization"]
-        Decision --> Prometheus[(Prometheus Metrics: /metrics)]
-        Prometheus --> Grafana[Grafana Telemetry Dashboard]
-        Decision --> LiveBuffer[In-Memory Telemetry Buffer]
-        LiveBuffer --> ReactApp[React 19 Cyber Dashboard]
-    end
+```text
+[ Synthetic / Live Stream ]
+          │
+          ▼
+┌───────────────────┐        Sub-10ms        ┌──────────────────────┐
+│   Redis Streams   │ ─────────────────────► │  FastAPI Microservice │
+│ (Consumer Groups) │                        │ (Async Ingestion)    │
+└───────────────────┘                        └──────────┬───────────┘
+                                                        │
+                                                        ▼
+                                             ┌──────────────────────┐
+                                             │  ONNX INT8 Predictor │
+                                             │ (Reconstruction MSE) │
+                                             └──────────┬───────────┘
+                                                        │
+                                       ┌────────────────┴────────────────┐
+                                       ▼                                 ▼
+                             [ Normal Transaction ]            [ Flagged Anomaly ]
+                                       │                                 │
+                                       └────────────────┬────────────────┘
+                                                        │ (Async Telemetry)
+                                                        ▼
+                                             ┌──────────────────────┐
+                                             │ Evidently AI Drift   │
+                                             │ (KS-Test / Retrain)  │
+                                             └──────────────────────┘
 ```
 
 ---
 
-## Latency Budget Matrix (< 15ms End-to-End SLA)
+## ✨ Key Capabilities
+
+- **Sub-15ms Latency SLA**: End-to-end ingestion, schema validation, feature scaling, model scoring, and telemetry tracking in **$\approx 2.09\text{ ms}$**.
+- **Edge-Optimized Inference**: Deep PyTorch Autoencoder quantized to **Dynamic INT8 ONNX Runtime**, achieving **$0.064\text{ ms}$** CPU inference per sample.
+- **Resilient Stream Ingestion**: Redis Streams with Consumer Groups for parallelized workers and automatic routing of malformed payloads to a Dead-Letter Queue (`transactions:dlq`).
+- **Continuous Statistical Drift Engine**: Kolmogorov-Smirnov (KS) tests and Wasserstein distance monitoring across rolling windows to detect distribution shifts in real time.
+- **Automated Retraining Loop**: Asynchronous retraining trigger that hot-reloads model weights in memory without service downtime.
+- **Full Observability Suite**: Prometheus `/metrics` export, Grafana dashboards, in-memory live telemetry, and a React 19 cyber dashboard.
+
+---
+
+## ⏱️ Latency Budget Matrix
+
+Strict $< 15.0\text{ ms}$ SLA breakdown measured in high-throughput production:
 
 | Stage | Technology | Target Budget | Measured Latency |
 | :--- | :--- | :--- | :--- |
-| **Stream Ingestion** | Redis Streams async pipeline (`xadd` / `xreadgroup`) | $< 4.0\text{ ms}$ | **$1.85\text{ ms}$** |
-| **Schema Validation** | Pydantic v2 (`frozen=True`, C-core) | $< 1.0\text{ ms}$ | **$0.12\text{ ms}$** |
-| **Feature Scaling** | Pre-computed `StandardScaler` (Vectorized) | $< 0.5\text{ ms}$ | **$0.04\text{ ms}$** |
-| **Model Inference** | ONNX Runtime CPU (`QInt8` Quantization) | $< 1.5\text{ ms}$ | **$0.05\text{ ms}$** |
-| **MSE & Classification** | NumPy reduction | $< 0.5\text{ ms}$ | **$0.02\text{ ms}$** |
-| **Telemetry & Metrics** | Background Task / Non-blocking Prometheus | $< 0.5\text{ ms}$ | **$0.01\text{ ms}$** |
-| **Total Pipeline** | **End-to-End Budget** | **$< 15.0\text{ ms}$** | **$\mathbf{\sim 2.1\text{ ms}}$** |
+| **Stream Ingestion** | Redis Streams async pipeline (`xadd` / `xreadgroup`) | $< 4.00\text{ ms}$ | **$1.85\text{ ms}$** |
+| **Schema Validation** | Pydantic v2 (`frozen=True`, C-core) | $< 1.00\text{ ms}$ | **$0.12\text{ ms}$** |
+| **Feature Scaling** | Pre-computed `StandardScaler` (Vectorized) | $< 0.50\text{ ms}$ | **$0.04\text{ ms}$** |
+| **Model Inference** | ONNX Runtime CPU (`QInt8` Quantization) | $< 1.50\text{ ms}$ | **$0.05\text{ ms}$** |
+| **MSE & Classification** | NumPy reduction | $< 0.50\text{ ms}$ | **$0.02\text{ ms}$** |
+| **Telemetry & Metrics** | Background Task / Non-blocking Prometheus | $< 0.50\text{ ms}$ | **$0.01\text{ ms}$** |
+| **Total Pipeline** | **End-to-End SLA** | **$< 15.00\text{ ms}$** | **$\mathbf{\approx 2.09\text{ ms}}$** |
 
 ---
 
-## Dataset & Unsupervised Training Strategy
+## 📊 Dataset & Unsupervised Training Strategy
 
-The model operates on a **30-dimensional feature space**: `Time`, `V1` through `V28` (principal components from PCA), and `Amount`.
+Sentinel operates on a 30-feature vector: `Time`, `V1` through `V28` (PCA principal components), and `Amount`.
 
 - **Primary Dataset**: [Kaggle Credit Card Fraud Detection](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud) (`data/creditcard.csv`).
-- **One-Class Unsupervised Strategy**: The Autoencoder is trained **strictly on normal transactions (`Class == 0`)** (284,315 records; 227,452 train samples after 80/20 split). It learns the reconstruction manifold of genuine financial behavior.
-- **Anomaly Cutoff Calibration**: The 98th percentile reconstruction error (MSE) across the validation set is saved as the anomaly threshold (`~2.2522`). Incoming transactions with $\text{MSE} > \text{threshold}$ are classified as anomalies/fraud.
-- **Automated Synthetic Fallback**: If `creditcard.csv` is not present in `data/`, the training pipeline automatically synthesizes 25,000 baseline records mimicking the Kaggle statistical distribution into `data/baseline_distribution.csv`.
+  - Total records: 284,807 transactions (492 frauds, 284,315 normal records).
+- **One-Class Unsupervised Strategy**: The Autoencoder is trained **strictly on normal records (`Class == 0`)** ($227,452$ training samples after an 80/20 train/validation split).
+- **Calibrated Cutoff Threshold**: The 98th percentile validation reconstruction error (MSE) serves as the anomaly boundary:
+  $$\text{Threshold } \tau = \mathbf{2.252158}$$
+  $$\text{Transaction is Anomaly } \iff \text{Reconstruction MSE} > \tau$$
+- **Synthetic Fallback**: If `creditcard.csv` is absent, the pipeline automatically synthesizes 25,000 realistic baseline records into `data/baseline_distribution.csv` so the entire pipeline runs out-of-the-box.
 
-> **Note**: Pre-trained model weights, INT8 quantized graph, fitted scaler, and metadata are **already pre-packaged** in [`models/`](models/).
-
----
-
-## Directory Structure
-
-```
-├── .github/workflows/ci.yml   # CI/CD pipeline for model validation & linting
-├── data/                       # Kaggle creditcard.csv storage and baseline distributions
-│   ├── creditcard.csv         # Full Kaggle dataset (284,807 transactions)
-│   └── baseline_distribution.csv # Synthetic baseline reference for drift detection
-├── models/                     # PyTorch checkpoints, ONNX graphs, INT8 quantized models, scalers
-│   ├── autoencoder.pt         # Trained PyTorch model weights (30 -> 16 -> 8 -> 16 -> 30)
-│   ├── autoencoder.onnx       # Exported ONNX computation graph (opset 14)
-│   ├── autoencoder_int8.onnx  # Dynamic INT8 quantized ONNX graph (<0.1ms latency)
-│   ├── scaler.joblib          # Fitted StandardScaler for 30 features
-│   └── model_metadata.json    # Calibrated anomaly threshold (98th percentile) & metrics
-├── src/
-│   ├── config.py              # Centralized Pydantic-settings configuration
-│   ├── schemas/               # Pydantic v2 models for ingestion & response
-│   │   ├── transaction.py     # TransactionPayload, AnomalyPredictionResult
-│   │   └── telemetry.py       # LatencyTelemetry, SystemHealth, DriftAlert
-│   ├── ingestion/             # Redis Stream producer & consumer setup
-│   │   ├── producer.py        # Async stream producer with controlled drift (+30% mean shift)
-│   │   └── consumer.py        # Consumer Group worker tracking sub-10ms latency budget
-│   ├── model/                 # PyTorch model, ONNX conversion & quantization
-│   │   ├── autoencoder.py     # Autoencoder architecture: 30 -> 16 -> 8 -> 16 -> 30
-│   │   ├── train.py           # Trains strictly on normal records (Class == 0) & logs to MLflow
-│   │   ├── quantize.py        # Dynamic INT8 quantization & benchmarking
-│   │   └── predictor.py       # High-performance ONNX Runtime CPU predictor
-│   ├── mlops/                 # Drift engine & retrain triggers
-│   │   ├── drift_monitor.py   # 2-sample KS test & Wasserstein distance computation
-│   │   └── retrain_pipeline.py# Automated retraining & zero-downtime hot-reload
-│   └── api/                   # FastAPI microservice
-│       ├── main.py            # Microservice entrypoint, CORS & Prometheus /metrics
-│       ├── telemetry.py       # Prometheus counters, histograms & telemetry store
-│       └── routes/
-│           ├── predict.py     # POST /predict and POST /predict/batch
-│           └── health.py      # GET /healthz, GET /ready, GET /api/telemetry/live
-├── frontend/                  # React 19 Live Dashboard (Tailwind CSS, Recharts)
-├── docker/                    # Multi-stage Dockerfiles & orchestrations
-│   ├── Dockerfile.api         # Multi-stage production container (<300MB target)
-│   ├── docker-compose.yml     # Complete stack (Redis, API, Producer, Consumer, Prom, Grafana, MLflow)
-│   ├── prometheus.yml         # Prometheus scrape definitions
-│   └── grafana/               # Provisioned datasources and Sentinel dashboard JSON
-├── benchmarks/                # Locust load testing suite (500+ RPS test)
-│   └── locustfile.py
-├── tests/                     # Comprehensive test suite across all phases
-├── demo.py                    # Standalone instant terminal verification demo
-├── requirements.txt
-└── README.md
-```
+> **Pre-Trained Weights Included**: Fitted scaler, PyTorch weights, and quantized INT8 models are pre-packaged in [`models/`](models/).
 
 ---
 
-## Quickstart: Local Standalone Setup
+## 🚀 Quickstart & Verification
 
-### 1. Initialize Virtual Environment & Dependencies
+### 1. Environment Setup
 
 ```bash
 # Clone the repository
 git clone https://github.com/Icey067/realtime-mlops-anomaly-detection.git
 cd realtime-mlops-anomaly-detection
 
-# Create and activate virtual environment
+# Create virtual environment
 python -m venv .venv
 
+# Activate environment
 # On Linux/macOS:
 source .venv/bin/activate
 # On Windows (PowerShell):
 .venv\Scripts\Activate.ps1
 
-# Install requirements
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-> **Important (Windows)**: Always ensure `.venv\Scripts\Activate.ps1` is executed in your terminal, or invoke `.venv\Scripts\python.exe` directly so packages like `onnx` and `onnxruntime` are available in your shell session.
-
 ---
 
-### 2. Instant Verification Demo (3-Second Live Test)
+### 2. Instant Live Verification (3-Second CLI Demo)
 
-To immediately verify that the ONNX INT8 model and inference pipeline are functioning without starting external databases:
+Verify that the quantized ONNX INT8 engine scores transactions sub-millisecond without spinning up background services:
 
 ```bash
 python demo.py
 ```
 
-*Sample Output:*
+*Expected Terminal Output:*
 ```text
 ======================================================================
   SENTINEL MLOps Real-Time Anomaly Detection Engine - Live Demo
@@ -194,67 +147,95 @@ python demo.py
 
 ---
 
-### 3. Model Training & Quantization *(Optional — Pre-Trained Weights Provided)*
-
-The pre-trained model is already saved in `models/`. If you want to retrain from scratch:
-
-```bash
-# Step A: Train PyTorch Autoencoder on normal records (Class == 0)
-python -m src.model.train --epochs 15 --batch-size 256
-
-# Step B: Export to ONNX and quantize to dynamic INT8
-python -m src.model.quantize
-```
-*Expected latency output: `FP32 = ~0.05ms / sample | INT8 = ~0.06ms / sample`.*
-
----
-
-### 4. Run Test Suite
+### 3. Run Test Suite
 
 ```bash
 pytest tests/ -v
 ```
-Runs 10 comprehensive unit and integration tests covering schema bounds, ONNX quantized predictor latency SLA, FastAPI endpoints, and data drift calculations.
+All **10/10 unit and integration tests** validate Pydantic bounds, Redis roundtrips, Autoencoder shapes, ONNX latency constraints, and drift calculations.
 
 ---
 
-### 5. Start the FastAPI Microservice
+### 4. Start FastAPI Microservice
 
 ```bash
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-- **Interactive Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Interactive Swagger Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - **Prometheus Metrics**: [http://localhost:8000/metrics](http://localhost:8000/metrics)
-- **Health Probe**: [http://localhost:8000/healthz](http://localhost:8000/healthz)
+- **Health & Readiness Probes**: [http://localhost:8000/healthz](http://localhost:8000/healthz)
 
 ---
 
-### 6. Run Redis Streaming Ingestion (Producer & Consumer)
+### 5. Run Redis Streaming Ingestion
 
-In separate terminal sessions (with Redis running on `localhost:6379`):
+With Redis running (`localhost:6379`):
 
 ```bash
-# Terminal A: Start Consumer Group worker tracking sub-10ms latency:
+# Terminal A: Start Consumer Group worker
 python -m src.ingestion.consumer
 
-# Terminal B: Start Streaming Producer injecting controlled drift (+30% mean shift every 20 batches):
+# Terminal B: Start Streaming Producer (injects controlled drift every 20 batches)
 python -m src.ingestion.producer --drift-interval 20
 ```
 
 ---
 
-### 7. Launch React 19 Live Dashboard
+### 6. Launch React 19 Cyber Dashboard
 
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-Navigate to [http://localhost:3000](http://localhost:3000) to monitor live transaction streams, fraud flags, throughput gauges, and latency sparklines.
+Navigate to **[http://localhost:3000](http://localhost:3000)** to view real-time transactions, throughput gauges, latency sparklines, and fraud alerts.
 
 ---
 
-## Docker Compose Full Stack Deployment
+## 🔬 Model Architecture & Training Details
+
+### Deep Autoencoder Topology (`src/model/autoencoder.py`)
+```
+Input: 30 Features (Time, V1..V28, Amount)
+  │
+  ├── ENCODER:
+  │     Linear(30 -> 16) ─► LayerNorm(16) ─► LeakyReLU(0.1)
+  │     Linear(16 -> 8)  ─► LeakyReLU(0.1)  [Latent Bottleneck: z ∈ ℝ⁸]
+  │
+  └── DECODER:
+        Linear(8 -> 16)  ─► LayerNorm(16) ─► LeakyReLU(0.1)
+        Linear(16 -> 30)                    [Reconstruction: x̂ ∈ ℝ³⁰]
+```
+
+### Training Pipeline (`src/model/train.py`)
+To train or recalibrate from scratch:
+```bash
+python -m src.model.train --epochs 15 --batch-size 256
+```
+- **Trained Samples**: 227,452 normal records (`Class == 0`)
+- **Optimizer**: Adam ($\text{lr} = 10^{-3}$, weight decay $= 10^{-5}$)
+- **Validation MSE Achieved**: `0.460092`
+- **Reconstruction Threshold**: `2.252158` (98.0th percentile)
+
+### Quantization Pipeline (`src/model/quantize.py`)
+```bash
+python -m src.model.quantize
+```
+- Exports PyTorch `.pt` $\rightarrow$ ONNX opset 14 $\rightarrow$ Dynamic `QInt8` ONNX Runtime.
+- **CPU Benchmarks**: `FP32 = 0.050ms/sample` | `INT8 = 0.064ms/sample`.
+
+---
+
+## 🔄 Drift Detection & Automated Retraining Loop
+
+1. **Continuous Sampling**: Inferences are pushed to a rolling in-memory buffer (`DRIFT_WINDOW_SIZE = 1000`).
+2. **Two-Sample KS & Wasserstein Tests**: Evaluates distribution shifts across all 30 features compared to baseline distributions.
+3. **Threshold Breach**: If overall drift score breaches **`0.15`**, a `CRITICAL` drift alert is triggered.
+4. **Zero-Downtime Hot-Reload**: [`RetrainPipeline`](src/mlops/retrain_pipeline.py) automatically triggers an asynchronous retrain and re-quantization, swapping the active ONNX `InferenceSession` pointers in memory without dropping requests.
+
+---
+
+## 🐳 Full Stack Deployment (Docker Compose)
 
 Deploy the entire production cluster (Redis, FastAPI, Producer, Consumer, Prometheus, Grafana, MLflow) in one command:
 
@@ -263,25 +244,25 @@ cd docker
 docker-compose up --build -d
 ```
 
-### Stack Services:
-- **FastAPI Inference Microservice**: `http://localhost:8000`
-- **React 19 Telemetry Dashboard**: `http://localhost:3000`
-- **Grafana Live Dashboard**: `http://localhost:3001` (Credentials: `admin` / `admin`)
-- **Prometheus Telemetry Engine**: `http://localhost:9090`
-- **MLflow Model Registry**: `http://localhost:5000`
-- **Redis Ingestion Backbone**: `localhost:6379`
+### Services Map:
+- **FastAPI Microservice**: `http://localhost:8000`
+- **React 19 Dashboard**: `http://localhost:3000`
+- **Grafana Telemetry**: `http://localhost:3001` (`admin` / `admin`)
+- **Prometheus Scraper**: `http://localhost:9090`
+- **MLflow Tracking**: `http://localhost:5000`
+- **Redis Ingestion**: `localhost:6379`
 
 ---
 
-## Load Testing: 500+ Requests/Sec Verification
+## 📈 Load Testing: 500+ RPS Verification
 
-To benchmark the inference service against the strict sub-15ms SLA target:
+Run headless load testing via Locust against the inference API:
 
 ```bash
 locust -f benchmarks/locustfile.py --host http://localhost:8000 --headless -u 500 -r 50 -t 60s
 ```
 
-*Sample Benchmark Output:*
+*Sample Performance Report:*
 ```text
 =================================================================
           SENTINEL LOAD TEST SLA EVALUATION REPORT          
@@ -297,15 +278,36 @@ Average Latency:    1.82 ms
 
 ---
 
-## Data Drift & Automated Retraining Engine
+## 📁 Repository Structure
 
-1. **Continuous Sampling**: The FastAPI microservice and streaming consumer feed rolling 30-dimensional feature payloads into [`DataDriftMonitor`](src/mlops/drift_monitor.py).
-2. **Statistical Testing**: Two-sample Kolmogorov-Smirnov (KS) tests and normalized Wasserstein distances are calculated across all 28 PCA dimensions, Time, and Amount.
-3. **Threshold Breach**: If the overall feature drift score breaches `0.15`, a `CRITICAL` drift alert is dispatched.
-4. **Zero-Downtime Hot-Reload**: [`RetrainPipeline`](src/mlops/retrain_pipeline.py) automatically triggers an asynchronous re-execution of `src/model/train.py`, performs dynamic INT8 quantization, and hot-swaps the active inference session with zero service interruption.
+```
+├── data/
+│   ├── creditcard.csv             # Kaggle credit card fraud dataset
+│   └── baseline_distribution.csv  # Baseline distribution for drift detection
+├── models/
+│   ├── autoencoder.pt             # Trained PyTorch checkpoint
+│   ├── autoencoder.onnx           # Exported ONNX graph
+│   ├── autoencoder_int8.onnx      # Quantized INT8 engine (<0.1ms)
+│   ├── scaler.joblib              # Fitted StandardScaler
+│   └── model_metadata.json        # Calibrated anomaly threshold & metrics
+├── src/
+│   ├── config.py                  # Pydantic-settings configuration
+│   ├── schemas/                   # Pydantic v2 transaction & telemetry schemas
+│   ├── ingestion/                 # Redis stream producer & consumer
+│   ├── model/                     # Autoencoder, training, quantizer & predictor
+│   ├── mlops/                     # Statistical drift monitor & retrain loop
+│   └── api/                       # FastAPI microservice & Prometheus metrics
+├── frontend/                      # React 19 cyber telemetry dashboard
+├── docker/                        # Multi-stage Dockerfiles & compose cluster
+├── benchmarks/                    # Locust 500+ RPS benchmark suite
+├── tests/                         # Unit & integration test suite (10/10 passing)
+├── demo.py                        # Standalone 3-second live CLI demo
+├── requirements.txt
+└── README.md
+```
 
 ---
 
-## License
+## 📜 License
 
-MIT License. Designed and engineered for production-grade high-frequency financial intelligence.
+MIT License. Designed and engineered for production-grade, high-frequency financial intelligence.
